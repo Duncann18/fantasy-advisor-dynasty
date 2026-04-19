@@ -752,112 +752,134 @@ function calcPitcherFP(st) {
 
 async function fetchMLBDirectory() {
   const yr = CURRENT_SEASON;
-  // Fetch MLB + AAA hitting & pitching in parallel
-  const urls = [
+
+  // All levels we want to cover — from MLB down to Low-A
+  const LEVELS = [
+    { id: 1,  label: "MLB",    isMinors: false },
+    { id: 11, label: "AAA",    isMinors: true  },
+    { id: 12, label: "AA",     isMinors: true  },
+    { id: 13, label: "High-A", isMinors: true  },
+    { id: 14, label: "Low-A",  isMinors: true  },
+  ];
+
+  // Step 1 — roster lists for every level (catches ALL players, even those with 0 games)
+  const rosterFetches = LEVELS.map(level =>
+    fetch(`${MLB_API}/sports/${level.id}/players?season=${yr}`)
+      .then(r => r.ok ? r.json() : { people: [] })
+      .catch(() => ({ people: [] }))
+      .then(data => ({ ...level, people: data.people || [] }))
+  );
+
+  // Step 2 — season stats for MLB + AAA (adds fantasy point calculations)
+  const statsUrls = [
     `${MLB_API}/stats?stats=season&season=${yr}&group=hitting&sportId=1&playerPool=ALL&limit=2000`,
     `${MLB_API}/stats?stats=season&season=${yr}&group=pitching&sportId=1&playerPool=ALL&limit=2000`,
     `${MLB_API}/stats?stats=season&season=${yr}&group=hitting&sportId=11&playerPool=ALL&limit=2000`,
     `${MLB_API}/stats?stats=season&season=${yr}&group=pitching&sportId=11&playerPool=ALL&limit=2000`,
   ];
-  const results = await Promise.all(urls.map(u =>
-    fetch(u).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
-  ));
-  const [mlbH, mlbP, aaaH, aaaP] = results;
-  const players = [];
-  const seen    = new Set();
+  const statTypes = ["hitter", "pitcher", "hitter", "pitcher"];
 
-  // Process a batch of splits
-  function processSplits(data, type, isMinors) {
-    const splits = data?.stats?.[0]?.splits || [];
+  const allResults = await Promise.all([
+    Promise.all(rosterFetches),
+    ...statsUrls.map(u =>
+      fetch(u).then(r => r.ok ? r.json() : null).catch(() => null)
+    ),
+  ]);
+
+  const rosterData = allResults[0];       // array of { id, label, isMinors, people[] }
+  const statsSets  = allResults.slice(1); // 4 stats API responses
+
+  // Build a stats lookup keyed by MLB player ID
+  // Stores best available data per player (prefer hitter if both exist)
+  const statsMap = {};
+  for (let i = 0; i < statsSets.length; i++) {
+    const type   = statTypes[i];
+    const splits = statsSets[i]?.stats?.[0]?.splits || [];
     for (const s of splits) {
-      const pid  = s.player?.id;
-      const key  = `${pid}-${type}`;
-      if (!pid || seen.has(key)) continue;
-      seen.add(key);
-      const st   = s.stat || {};
-      const gp   = st.gamesPlayed || 1;
-      const gs   = st.gamesStarted || 0;
-      const posAbbr = s.position?.abbreviation || "";
-      const pos  = type === "hitter" ? mapPos(posAbbr, 0, gp) : mapPos(posAbbr, gs, gp);
-      const age  = s.player?.currentAge || 0;
-      const fp   = type === "hitter" ? calcHitterFP(st) : calcPitcherFP(st);
+      const pid = s.player?.id;
+      if (!pid) continue;
+      // Don't overwrite an existing hitter entry with a pitcher one
+      if (statsMap[pid] && statsMap[pid].type === "hitter" && type === "pitcher") continue;
+      statsMap[pid] = {
+        type,
+        stat:  s.stat || {},
+        gp:    s.stat?.gamesPlayed  || 0,
+        gs:    s.stat?.gamesStarted || 0,
+        posAbbr: s.position?.abbreviation || "",
+        team:  s.team?.abbreviation || "?",
+      };
+    }
+  }
+
+  // Build the full player list from roster data, enriched with stats where available
+  const players = [];
+  const seen    = new Set();   // de-dupe by MLB player ID
+
+  for (const level of rosterData) {
+    for (const p of level.people) {
+      const pid = p.id;
+      if (!pid || seen.has(pid)) continue;
+      seen.add(pid);
+
+      const info     = statsMap[pid];
+      const posAbbr  = info?.posAbbr || p.primaryPosition?.abbreviation || "";
+      const gp       = info?.gp || 0;
+      const gs       = info?.gs || 0;
+      const st       = info?.stat || {};
+
+      // Determine player type from position
+      const pitcherPos = ["P","SP","RP"];
+      const isPitcher  = pitcherPos.includes(posAbbr) ||
+                         p.primaryPosition?.type === "Pitcher";
+      const type = info ? info.type : (isPitcher ? "pitcher" : "hitter");
+      const pos  = type === "hitter"
+        ? mapPos(posAbbr, 0, gp)
+        : mapPos(posAbbr, gs, gp);
+
+      const age      = p.currentAge || 0;
+      const teamAbbr = info?.team || p.currentTeam?.abbreviation || "?";
+
+      const fp    = gp > 0
+        ? (type === "hitter" ? calcHitterFP(st) : calcPitcherFP(st))
+        : 0;
       const fpAvg = gp > 0 ? Math.round((fp / gp) * 100) / 100 : 0;
 
-      const base = {
-        id: `mlb-${pid}-${type}`,
-        mlbId: pid,
-        name: s.player?.fullName || "Unknown",
-        team: s.team?.abbreviation || "?",
+      players.push({
+        id:        `mlb-${pid}-${type}`,
+        mlbId:     pid,
+        name:      p.fullName || "Unknown",
+        team:      teamAbbr,
         pos, type, age,
-        isProspect: isMinors || age <= 23,
-        isMinors,
+        isProspect: level.isMinors || age <= 23,
+        isMinors:   level.isMinors,
+        levelLabel: level.label,   // "MLB", "AAA", "AA", "High-A", "Low-A"
         gp, fpAvg, fpTotal: fp,
         status: "FA",
-      };
-
-      if (type === "hitter") {
-        players.push({ ...base,
-          hr:  st.homeRuns       || 0,
-          sb:  st.stolenBases    || 0,
-          rbi: st.rbi            || 0,
-          r:   st.runs           || 0,
-          bb:  st.baseOnBalls    || 0,
-          so:  st.strikeOuts     || 0,
-          h:   st.hits           || 0,
-          ab:  st.atBats         || 0,
-        });
-      } else {
-        const ip = parseIP(st.inningsPitched);
-        players.push({ ...base,
-          ip,
-          era: parseFloat(st.era) || 0,
-          k:   st.strikeOuts      || 0,
-          w:   st.wins            || 0,
-          sv:  st.saves           || 0,
-          hld: st.holds           || 0,
-          qs:  st.qualityStarts   || 0,
-        });
-      }
+        eligible: pos,
+        hr:  st.homeRuns    || 0,
+        sb:  st.stolenBases || 0,
+        rbi: st.rbi         || 0,
+        r:   st.runs        || 0,
+        bb:  st.baseOnBalls || 0,
+        so:  st.strikeOuts  || 0,
+        h:   st.hits        || 0,
+        ab:  st.atBats      || 0,
+        ip:  parseIP(st.inningsPitched),
+        era: parseFloat(st.era) || 0,
+        k:   st.strikeOuts  || 0,
+        w:   st.wins        || 0,
+        sv:  st.saves       || 0,
+        hld: st.holds       || 0,
+        qs:  st.qualityStarts || 0,
+      });
     }
   }
 
-  processSplits(mlbH, "hitter",  false);
-  processSplits(mlbP, "pitcher", false);
-  processSplits(aaaH, "hitter",  true);
-  processSplits(aaaP, "pitcher", true);
-
-  // Batch-fetch ages for players missing currentAge from the stats endpoint
-  const missingAge = [...new Set(players.filter(p => !p.age).map(p => p.mlbId))];
-  if (missingAge.length > 0) {
-    const CHUNK = 250;
-    const ageMap = {};
-    for (let i = 0; i < missingAge.length; i += CHUNK) {
-      try {
-        const ids = missingAge.slice(i, i + CHUNK).join(",");
-        const resp = await fetch(
-          `${MLB_API}/people?personIds=${ids}&fields=people,id,currentAge,birthDate`
-        ).then(r => r.json());
-        for (const person of (resp.people || [])) {
-          if (person.currentAge) {
-            ageMap[person.id] = person.currentAge;
-          } else if (person.birthDate) {
-            const b = new Date(person.birthDate), now = new Date();
-            let a = now.getFullYear() - b.getFullYear();
-            if (now.getMonth() < b.getMonth() || (now.getMonth() === b.getMonth() && now.getDate() < b.getDate())) a--;
-            ageMap[person.id] = a;
-          }
-        }
-      } catch(_) {}
-    }
-    for (const p of players) {
-      if (!p.age && ageMap[p.mlbId]) {
-        p.age = ageMap[p.mlbId];
-        p.isProspect = p.isMinors || p.age <= 23;
-      }
-    }
-  }
-
-  return players.sort((a, b) => b.fpAvg - a.fpAvg);
+  // Sort: players with stats first (by fpAvg), then alphabetically for 0-game players
+  return players.sort((a, b) => {
+    if (b.fpAvg !== a.fpAvg) return b.fpAvg - a.fpAvg;
+    return a.name.localeCompare(b.name);
+  });
 }
 
 /* ── PLAYER SEARCH DROPDOWN ────────────────────────────────────*/
@@ -982,7 +1004,7 @@ function FaForm({ onAdd, mlbDir, ownedNames }) {
       <h3 className="font-bold text-gray-800 mb-1">Add Free Agent / Waiver Target</h3>
       <p className="text-xs text-gray-400 mb-4">
         {mlbDir?.length
-          ? `🟢 Live directory loaded — ${mlbDir.length.toLocaleString()} players (MLB + AAA). Search below or fill manually.`
+          ? `🟢 Live directory loaded — ${mlbDir.length.toLocaleString()} players (MLB · AAA · AA · High-A · Low-A). Search below or fill manually.`
           : "Load the live directory above to auto-fill stats, or enter manually."}
       </p>
 
@@ -1937,8 +1959,121 @@ function FaAnalyzerTab({ roster, league, onFaabChange }) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   LINEUP VS FA COMPARISON
+   LINEUP VS FA COMPARISON  — sub-components (top-level for Babel)
    ═══════════════════════════════════════════════════════════════ */
+
+function CompareStatRow({ label, rVal, fVal, higherBetter }) {
+  var hb = higherBetter === undefined ? true : higherBetter;
+  var rN = parseFloat(rVal) || 0;
+  var fN = parseFloat(fVal) || 0;
+  var rWins = hb ? rN > fN : rN < fN;
+  var fWins = hb ? fN > rN : fN < rN;
+  var rDisplay = (rVal === null || rVal === undefined) ? "—" : rVal;
+  var fDisplay = (fVal === null || fVal === undefined) ? "—" : fVal;
+  return (
+    <div className="grid grid-cols-3 text-xs py-1 border-b border-gray-100 last:border-0">
+      <span className={"text-right pr-3 font-semibold " + (rWins ? "text-green-600" : "text-gray-500")}>{rDisplay}</span>
+      <span className="text-center text-gray-400 font-medium">{label}</span>
+      <span className={"text-left pl-3 font-semibold " + (fWins ? "text-green-600" : "text-gray-500")}>{fDisplay}</span>
+    </div>
+  );
+}
+
+function comparePlayerWindow(age) {
+  if (!age) return "";
+  if (age <= 23) return "10+ yr window";
+  if (age <= 26) return "7-8 yr window";
+  if (age <= 29) return "4-5 yr window";
+  if (age <= 32) return "1-2 yr window";
+  return "End of window";
+}
+
+function CompareCard({ player, side }) {
+  if (!player) {
+    return (
+      <div className={"flex-1 rounded-xl border-2 border-dashed flex items-center justify-center h-48 " + (side === "roster" ? "border-slate-200" : "border-blue-200")}>
+        <span className="text-gray-300 text-sm">{side === "roster" ? "Select from lineup" : "Search free agent"}</span>
+      </div>
+    );
+  }
+  var ds = dynastyScore(player);
+  var dStars = ds >= 75 ? "★★★★★" : ds >= 60 ? "★★★★" : ds >= 45 ? "★★★" : ds >= 30 ? "★★" : "★";
+  var win = comparePlayerWindow(player.age);
+  var cardBg = side === "roster" ? "border-slate-300 bg-slate-50" : "border-blue-300 bg-blue-50";
+  var posBg  = side === "roster" ? "bg-slate-200 text-slate-700" : "bg-blue-200 text-blue-800";
+  var fpStr  = player.fpAvg ? player.fpAvg.toFixed(1) : "0.0";
+  return (
+    <div className={"flex-1 rounded-xl border p-4 " + cardBg}>
+      <div className="flex items-start justify-between mb-2">
+        <div>
+          <div className="flex items-center gap-2 mb-0.5">
+            <span className={"text-xs font-bold px-1.5 py-0.5 rounded " + posBg}>{player.pos}</span>
+            <span className="text-xs text-gray-400">{player.team}</span>
+          </div>
+          <div className="font-bold text-gray-800 text-sm leading-tight">{player.name}</div>
+          {player.age > 0 && <div className="text-xs text-gray-400">Age {player.age} · {win}</div>}
+        </div>
+        <div className="text-right">
+          <div className="text-yellow-500 text-xs tracking-tight">{dStars}</div>
+          <div className="text-xs text-gray-400">DS {ds}</div>
+        </div>
+      </div>
+      <div className="mt-3 space-y-0.5">
+        {player.type !== "pitcher" ? (
+          <div>
+            <CompareStatRow label="FP/G" rVal={side==="roster" ? fpStr : null} fVal={side==="fa" ? fpStr : null} />
+            {player.hr  > 0 && <CompareStatRow label="HR"  rVal={side==="roster" ? player.hr  : null} fVal={side==="fa" ? player.hr  : null} />}
+            {player.sb  > 0 && <CompareStatRow label="SB"  rVal={side==="roster" ? player.sb  : null} fVal={side==="fa" ? player.sb  : null} />}
+            {player.rbi > 0 && <CompareStatRow label="RBI" rVal={side==="roster" ? player.rbi : null} fVal={side==="fa" ? player.rbi : null} />}
+          </div>
+        ) : (
+          <div>
+            <CompareStatRow label="FP/G" rVal={side==="roster" ? fpStr : null} fVal={side==="fa" ? fpStr : null} />
+            {player.era > 0 && <CompareStatRow label="ERA" rVal={side==="roster" ? player.era.toFixed(2) : null} fVal={side==="fa" ? player.era.toFixed(2) : null} higherBetter={false}/>}
+            {player.sv  > 0 && <CompareStatRow label="SV"  rVal={side==="roster" ? player.sv  : null} fVal={side==="fa" ? player.sv  : null} />}
+            {player.k   > 0 && <CompareStatRow label="K"   rVal={side==="roster" ? player.k   : null} fVal={side==="fa" ? player.k   : null} />}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function CompareTable({ rp, fp }) {
+  if (!rp || !fp) return null;
+  var isHitter = rp.type !== "pitcher" || fp.type !== "pitcher";
+  var rpDs = dynastyScore(rp);
+  var fpDs = dynastyScore(fp);
+  var rpLast = rp.name.split(" ").slice(-1)[0];
+  var fpLast = fp.name.split(" ").slice(-1)[0];
+  return (
+    <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-4 w-full max-w-md mx-auto">
+      <div className="grid grid-cols-3 text-xs font-bold text-gray-500 mb-2">
+        <span className="text-right pr-3 truncate">{rpLast}</span>
+        <span className="text-center">Stat</span>
+        <span className="text-left pl-3 truncate">{fpLast}</span>
+      </div>
+      <CompareStatRow label="FP/G"    rVal={rp.fpAvg ? rp.fpAvg.toFixed(1) : "0.0"} fVal={fp.fpAvg ? fp.fpAvg.toFixed(1) : "0.0"} />
+      <CompareStatRow label="Dynasty" rVal={rpDs} fVal={fpDs} />
+      <CompareStatRow label="Age"     rVal={rp.age || "?"} fVal={fp.age || "?"} higherBetter={false} />
+      {isHitter ? (
+        <div>
+          {((rp.hr||0)+(fp.hr||0))   > 0 && <CompareStatRow label="HR"  rVal={rp.hr||0}  fVal={fp.hr||0}  />}
+          {((rp.sb||0)+(fp.sb||0))   > 0 && <CompareStatRow label="SB"  rVal={rp.sb||0}  fVal={fp.sb||0}  />}
+          {((rp.rbi||0)+(fp.rbi||0)) > 0 && <CompareStatRow label="RBI" rVal={rp.rbi||0} fVal={fp.rbi||0} />}
+          {((rp.r||0)+(fp.r||0))     > 0 && <CompareStatRow label="R"   rVal={rp.r||0}   fVal={fp.r||0}   />}
+        </div>
+      ) : (
+        <div>
+          {((rp.era||0)+(fp.era||0)) > 0 && <CompareStatRow label="ERA" rVal={rp.era ? rp.era.toFixed(2) : "0.00"} fVal={fp.era ? fp.era.toFixed(2) : "0.00"} higherBetter={false}/>}
+          {((rp.k||0)+(fp.k||0))     > 0 && <CompareStatRow label="K"   rVal={rp.k||0}   fVal={fp.k||0}   />}
+          {((rp.sv||0)+(fp.sv||0))   > 0 && <CompareStatRow label="SV"  rVal={rp.sv||0}  fVal={fp.sv||0}  />}
+          {((rp.w||0)+(fp.w||0))     > 0 && <CompareStatRow label="W"   rVal={rp.w||0}   fVal={fp.w||0}   />}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function LineupVsFACompare({ roster, mlbDir, positionNeeds, categoryNeeds, remaining }) {
   const [rosterPlayer, setRosterPlayer] = useState(null);
@@ -1946,205 +2081,90 @@ function LineupVsFACompare({ roster, mlbDir, positionNeeds, categoryNeeds, remai
   const [faQuery,      setFaQuery]      = useState("");
   const [faOpen,       setFaOpen]       = useState(false);
 
-  /* ── helpers ─────────────────────────────────────────────── */
-  function dynastyWindow(age) {
-    if (!age) return "";
-    if (age <= 23) return "10+ yr window";
-    if (age <= 26) return "7–8 yr window";
-    if (age <= 29) return "4–5 yr window";
-    if (age <= 32) return "1–2 yr window";
-    return "End of window";
-  }
-
-  /* ── search FA in mlbDir ─────────────────────────────────── */
   const faResults = useMemo(() => {
     if (!faQuery || faQuery.length < 2) return [];
     const q = faQuery.toLowerCase();
-    return mlbDir.filter(p => p.name.toLowerCase().includes(q)).slice(0, 8);
+    return mlbDir.filter(function(p) { return p.name.toLowerCase().indexOf(q) >= 0; }).slice(0, 8);
   }, [faQuery, mlbDir]);
 
-  /* ── roster player list ──────────────────────────────────── */
-  const active   = (roster?.all || []).filter(p => p.status === "Act");
-  const reserve  = (roster?.all || []).filter(p => p.status === "Res");
+  const active  = (roster && roster.all ? roster.all : []).filter(function(p) { return p.status === "Act"; });
+  const reserve = (roster && roster.all ? roster.all : []).filter(function(p) { return p.status === "Res"; });
 
-  /* ── scoring ─────────────────────────────────────────────── */
   function prodScore(p) {
     if (!p) return 0;
     if (p.type === "pitcher") {
-      let s = 50;
+      var s = 50;
       if (p.era > 0) s += Math.max(-25, Math.min(25, (4.00 - p.era) * 8));
       if (p.fpAvg > 0) s += Math.min(25, p.fpAvg * 1.5);
       return Math.max(0, Math.min(100, s));
     }
-    let s = 50;
-    if (p.fpAvg > 0) s += Math.min(25, p.fpAvg * 2);
-    if (p.hr  > 0)   s += Math.min(10, p.hr  / 3);
-    if (p.sb  > 0)   s += Math.min(10, p.sb  / 2);
-    return Math.max(0, Math.min(100, s));
+    var s2 = 50;
+    if (p.fpAvg > 0) s2 += Math.min(25, p.fpAvg * 2);
+    if (p.hr > 0)    s2 += Math.min(10, p.hr / 3);
+    if (p.sb > 0)    s2 += Math.min(10, p.sb / 2);
+    return Math.max(0, Math.min(100, s2));
   }
 
-  function dsFor(p) { return p ? dynastyScore(p) : 0; }
+  var rprod   = prodScore(rosterPlayer);
+  var fprod   = prodScore(faPlayer);
+  var rds     = rosterPlayer ? dynastyScore(rosterPlayer) : 0;
+  var fds     = faPlayer     ? dynastyScore(faPlayer)     : 0;
+  var prodAdv = fprod - rprod;
+  var dsAdv   = fds   - rds;
+  var overall = prodAdv * 0.55 + dsAdv * 0.45;
 
-  const rprod = prodScore(rosterPlayer);
-  const fprod = prodScore(faPlayer);
-  const rds   = dsFor(rosterPlayer);
-  const fds   = dsFor(faPlayer);
-
-  const prodAdv = fprod - rprod;   // positive = FA is better
-  const dsAdv   = fds   - rds;
-
-  // For a direct swap: production weighted slightly more (55%) than dynasty (45%)
-  const overall = prodAdv * 0.55 + dsAdv * 0.45;
-
-  function verdict() {
+  function getVerdict() {
     if (!rosterPlayer || !faPlayer) return null;
-    if (overall >= 20) return { label: "Clear Upgrade 🔥",        color: "bg-green-100 text-green-800 border-green-300",  desc: "Make this move — significant improvement." };
-    if (overall >=  8) return { label: "Slight Upgrade ✅",        color: "bg-emerald-50 text-emerald-700 border-emerald-200", desc: "Lean toward adding the FA. Modest gain." };
-    if (overall >= -8) return { label: "Too Close to Call ⚖️",    color: "bg-amber-50 text-amber-700 border-amber-200",  desc: "Nearly identical value. Consider position fit & FAAB." };
-    if (overall >= -20) return { label: "Keep Your Player 🛡️",    color: "bg-orange-50 text-orange-700 border-orange-200", desc: "Your current player has the edge. Hold." };
-    return              { label: "Definitely Keep ❌",             color: "bg-red-50 text-red-700 border-red-200",        desc: "Don't make this move." };
+    if (overall >= 20)  return { label: "Clear Upgrade", emoji: "🔥", color: "bg-green-100 text-green-800 border-green-300",    desc: "Make this move — significant improvement." };
+    if (overall >= 8)   return { label: "Slight Upgrade", emoji: "✅", color: "bg-emerald-50 text-emerald-700 border-emerald-200", desc: "Lean toward adding the FA. Modest gain." };
+    if (overall >= -8)  return { label: "Too Close to Call", emoji: "⚖️", color: "bg-amber-50 text-amber-700 border-amber-200",     desc: "Nearly identical value. Consider position fit and FAAB." };
+    if (overall >= -20) return { label: "Keep Your Player", emoji: "🛡️", color: "bg-orange-50 text-orange-700 border-orange-200",  desc: "Your current player has the edge. Hold." };
+    return               { label: "Definitely Keep", emoji: "❌", color: "bg-red-50 text-red-700 border-red-200",              desc: "Don't make this move." };
   }
 
-  const v = verdict();
-
-  /* Position fit warning */
-  function posWarn() {
+  function getPosWarn() {
     if (!rosterPlayer || !faPlayer) return null;
-    const rPos = rosterPlayer.pos;
-    const faEligible = (faPlayer.eligible || faPlayer.pos || "").split(",").map(s => s.trim());
-    if (!faEligible.includes(rPos) && rPos) {
-      return `⚠️ ${faPlayer.name} isn't eligible at ${rPos}. Check your roster flexibility before making this move.`;
+    var rPos = rosterPlayer.pos;
+    var faEligible = (faPlayer.eligible || faPlayer.pos || "").split(",").map(function(s) { return s.trim(); });
+    if (rPos && faEligible.indexOf(rPos) < 0) {
+      return faPlayer.name + " isn't eligible at " + rPos + ". Check your roster flexibility before making this move.";
     }
     return null;
   }
 
-  /* ── Stat Row ────────────────────────────────────────────── */
-  function StatRow({ label, rVal, fVal, higherBetter = true }) {
-    const rN = parseFloat(rVal) || 0;
-    const fN = parseFloat(fVal) || 0;
-    const rWins = higherBetter ? rN > fN : rN < fN;
-    const fWins = higherBetter ? fN > rN : fN < rN;
-    return (
-      <div className="grid grid-cols-3 text-xs py-1 border-b border-gray-100 last:border-0">
-        <span className={`text-right pr-3 font-semibold ${rWins ? "text-green-600" : "text-gray-500"}`}>{rVal ?? "—"}</span>
-        <span className="text-center text-gray-400 font-medium">{label}</span>
-        <span className={`text-left pl-3 font-semibold ${fWins ? "text-green-600" : "text-gray-500"}`}>{fVal ?? "—"}</span>
-      </div>
-    );
-  }
+  var v    = getVerdict();
+  var warn = getPosWarn();
 
-  /* ── Player Card ─────────────────────────────────────────── */
-  function CompareCard({ player, side }) {
-    if (!player) return (
-      <div className={`flex-1 rounded-xl border-2 border-dashed flex items-center justify-center h-48 ${side === "roster" ? "border-slate-200" : "border-blue-200"}`}>
-        <span className="text-gray-300 text-sm">{side === "roster" ? "Select from lineup →" : "← Search free agent"}</span>
-      </div>
-    );
-    const ds = dynastyScore(player);
-    const dStars = ds >= 75 ? "★★★★★" : ds >= 60 ? "★★★★" : ds >= 45 ? "★★★" : ds >= 30 ? "★★" : "★";
-    const win = dynastyWindow(player.age);
-    return (
-      <div className={`flex-1 rounded-xl border p-4 ${side === "roster" ? "border-slate-300 bg-slate-50" : "border-blue-300 bg-blue-50"}`}>
-        <div className="flex items-start justify-between mb-2">
-          <div>
-            <div className="flex items-center gap-2 mb-0.5">
-              <span className={`text-xs font-bold px-1.5 py-0.5 rounded ${side === "roster" ? "bg-slate-200 text-slate-700" : "bg-blue-200 text-blue-800"}`}>{player.pos}</span>
-              <span className="text-xs text-gray-400">{player.team}</span>
-            </div>
-            <div className="font-bold text-gray-800 text-sm leading-tight">{player.name}</div>
-            {player.age > 0 && <div className="text-xs text-gray-400">Age {player.age} · {win}</div>}
-          </div>
-          <div className="text-right">
-            <div className="text-yellow-500 text-xs tracking-tight">{dStars}</div>
-            <div className="text-xs text-gray-400">DS {ds}</div>
-          </div>
-        </div>
-        <div className="mt-3 space-y-0.5">
-          {player.type !== "pitcher" ? (
-            <>
-              <StatRow label="FP/G" rVal={side==="roster"?player.fpAvg?.toFixed(1):undefined} fVal={side==="fa"?player.fpAvg?.toFixed(1):undefined} />
-              {player.hr  > 0 && <StatRow label="HR"  rVal={side==="roster"?player.hr:undefined}  fVal={side==="fa"?player.hr:undefined}  />}
-              {player.sb  > 0 && <StatRow label="SB"  rVal={side==="roster"?player.sb:undefined}  fVal={side==="fa"?player.sb:undefined}  />}
-              {player.rbi > 0 && <StatRow label="RBI" rVal={side==="roster"?player.rbi:undefined} fVal={side==="fa"?player.rbi:undefined} />}
-            </>
-          ) : (
-            <>
-              <StatRow label="FP/G" rVal={side==="roster"?player.fpAvg?.toFixed(1):undefined} fVal={side==="fa"?player.fpAvg?.toFixed(1):undefined} />
-              {player.era > 0 && <StatRow label="ERA" rVal={side==="roster"?(player.era?.toFixed(2)):undefined} fVal={side==="fa"?(player.era?.toFixed(2)):undefined} higherBetter={false}/>}
-              {player.sv  > 0 && <StatRow label="SV"  rVal={side==="roster"?player.sv:undefined}  fVal={side==="fa"?player.sv:undefined}  />}
-              {player.k   > 0 && <StatRow label="K"   rVal={side==="roster"?player.k:undefined}   fVal={side==="fa"?player.k:undefined}   />}
-            </>
-          )}
-        </div>
-      </div>
-    );
-  }
-
-  /* ── Comparison Table (middle) ───────────────────────────── */
-  function CompareTable() {
-    if (!rosterPlayer || !faPlayer) return null;
-    const rp = rosterPlayer, fp = faPlayer;
-    const isHitter = rp.type !== "pitcher" || fp.type !== "pitcher";
-    return (
-      <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-4 w-full max-w-md mx-auto">
-        <div className="grid grid-cols-3 text-xs font-bold text-gray-500 mb-2">
-          <span className="text-right pr-3 truncate">{rp.name.split(" ").slice(-1)[0]}</span>
-          <span className="text-center">Stat</span>
-          <span className="text-left pl-3 truncate">{fp.name.split(" ").slice(-1)[0]}</span>
-        </div>
-        <StatRow label="FP/G"  rVal={rp.fpAvg?.toFixed(1)}  fVal={fp.fpAvg?.toFixed(1)} />
-        <StatRow label="Dynasty" rVal={dsFor(rp)} fVal={dsFor(fp)} />
-        <StatRow label="Age"   rVal={rp.age||"?"} fVal={fp.age||"?"} higherBetter={false}/>
-        {isHitter ? (
-          <>
-            {(rp.hr||fp.hr)   > 0 && <StatRow label="HR"  rVal={rp.hr}  fVal={fp.hr}  />}
-            {(rp.sb||fp.sb)   > 0 && <StatRow label="SB"  rVal={rp.sb}  fVal={fp.sb}  />}
-            {(rp.rbi||fp.rbi) > 0 && <StatRow label="RBI" rVal={rp.rbi} fVal={fp.rbi} />}
-            {(rp.r||fp.r)     > 0 && <StatRow label="R"   rVal={rp.r}   fVal={fp.r}   />}
-          </>
-        ) : (
-          <>
-            {(rp.era||fp.era) > 0 && <StatRow label="ERA" rVal={rp.era?.toFixed(2)} fVal={fp.era?.toFixed(2)} higherBetter={false}/>}
-            {(rp.k||fp.k)     > 0 && <StatRow label="K"   rVal={rp.k}   fVal={fp.k}   />}
-            {(rp.sv||fp.sv)   > 0 && <StatRow label="SV"  rVal={rp.sv}  fVal={fp.sv}  />}
-            {(rp.w||fp.w)     > 0 && <StatRow label="W"   rVal={rp.w}   fVal={fp.w}   />}
-          </>
-        )}
-      </div>
-    );
-  }
-
-  /* ── render ─────────────────────────────────────────────── */
   return (
     <div className="bg-white rounded-xl shadow p-5 space-y-4">
       <div>
-        <h3 className="font-bold text-gray-800 text-sm">⚔️ Lineup vs Free Agent</h3>
+        <h3 className="font-bold text-gray-800 text-sm">Lineup vs Free Agent</h3>
         <p className="text-xs text-gray-400 mt-0.5">Pick someone from your active lineup and a free agent — we'll tell you if the swap is worth it.</p>
       </div>
 
-      {/* Selectors row */}
       <div className="flex flex-col sm:flex-row gap-3">
-        {/* Roster picker */}
         <div className="flex-1">
           <label className="block text-xs font-medium text-gray-500 mb-1">Your Lineup Player</label>
           <select
             className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-slate-400"
-            value={rosterPlayer?.id || ""}
-            onChange={e => {
-              const id = e.target.value;
-              const all = roster?.all || [];
-              setRosterPlayer(all.find(p => p.id === id) || null);
+            value={rosterPlayer ? rosterPlayer.id : ""}
+            onChange={function(e) {
+              var id = e.target.value;
+              var all = roster && roster.all ? roster.all : [];
+              var found = null;
+              for (var i = 0; i < all.length; i++) { if (all[i].id === id) { found = all[i]; break; } }
+              setRosterPlayer(found);
             }}
           >
             <option value="">— Select a player —</option>
             {active.length > 0 && (
               <optgroup label="Active">
-                {active.map(p => <option key={p.id} value={p.id}>{p.name} ({p.pos})</option>)}
+                {active.map(function(p) { return <option key={p.id} value={p.id}>{p.name} ({p.pos})</option>; })}
               </optgroup>
             )}
             {reserve.length > 0 && (
               <optgroup label="Reserve / IL">
-                {reserve.map(p => <option key={p.id} value={p.id}>{p.name} ({p.pos})</option>)}
+                {reserve.map(function(p) { return <option key={p.id} value={p.id}>{p.name} ({p.pos})</option>; })}
               </optgroup>
             )}
           </select>
@@ -2154,60 +2174,58 @@ function LineupVsFACompare({ roster, mlbDir, positionNeeds, categoryNeeds, remai
           <span className="text-gray-300 font-bold text-xl">vs</span>
         </div>
 
-        {/* FA search */}
         <div className="flex-1 relative">
           <label className="block text-xs font-medium text-gray-500 mb-1">Free Agent</label>
           <input
             type="text"
-            placeholder={mlbDir.length === 0 ? "Load player directory first ↑" : "Search free agents…"}
+            placeholder={mlbDir.length === 0 ? "Load player directory first" : "Search free agents..."}
             disabled={mlbDir.length === 0}
             value={faQuery}
-            onChange={e => { setFaQuery(e.target.value); setFaOpen(true); setFaPlayer(null); }}
-            onFocus={() => setFaOpen(true)}
-            onBlur={() => setTimeout(() => setFaOpen(false), 150)}
+            onChange={function(e) { setFaQuery(e.target.value); setFaOpen(true); setFaPlayer(null); }}
+            onFocus={function() { setFaOpen(true); }}
+            onBlur={function() { setTimeout(function() { setFaOpen(false); }, 150); }}
             className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 disabled:bg-gray-50 disabled:text-gray-400"
           />
           {faOpen && faResults.length > 0 && (
             <div className="absolute z-20 left-0 right-0 mt-1 bg-white border border-gray-200 rounded-lg shadow-lg max-h-48 overflow-y-auto">
-              {faResults.map(p => (
-                <button
-                  key={p.id}
-                  onMouseDown={() => { setFaPlayer(p); setFaQuery(p.name); setFaOpen(false); }}
-                  className="w-full text-left px-3 py-2 text-sm hover:bg-blue-50 flex items-center gap-2"
-                >
-                  <span className="text-xs bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded font-bold">{p.pos}</span>
-                  <span className="font-medium text-gray-800">{p.name}</span>
-                  <span className="text-xs text-gray-400 ml-auto">{p.team}</span>
-                </button>
-              ))}
+              {faResults.map(function(p) {
+                return (
+                  <button
+                    key={p.id}
+                    onMouseDown={function() { setFaPlayer(p); setFaQuery(p.name); setFaOpen(false); }}
+                    className="w-full text-left px-3 py-2 text-sm hover:bg-blue-50 flex items-center gap-2"
+                  >
+                    <span className="text-xs bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded font-bold">{p.pos}</span>
+                    <span className="font-medium text-gray-800">{p.name}</span>
+                    <span className="text-xs text-gray-400 ml-auto">{p.team}</span>
+                  </button>
+                );
+              })}
             </div>
           )}
           {faPlayer && (
-            <button onClick={() => { setFaPlayer(null); setFaQuery(""); }} className="absolute right-2 top-7 text-gray-300 hover:text-gray-500 text-lg leading-none">×</button>
+            <button onClick={function() { setFaPlayer(null); setFaQuery(""); }} className="absolute right-2 top-7 text-gray-300 hover:text-gray-500 text-lg leading-none">x</button>
           )}
         </div>
       </div>
 
-      {/* Side-by-side cards */}
       {(rosterPlayer || faPlayer) && (
         <div className="flex flex-col sm:flex-row gap-3">
           <CompareCard player={rosterPlayer} side="roster" />
-          <CompareCard player={faPlayer}     side="fa"     />
+          <CompareCard player={faPlayer}     side="fa" />
         </div>
       )}
 
-      {/* Comparison table */}
-      <CompareTable />
+      <CompareTable rp={rosterPlayer} fp={faPlayer} />
 
-      {/* Verdict */}
       {v && (
-        <div className={`rounded-xl border px-5 py-4 ${v.color}`}>
-          <div className="font-bold text-base mb-1">{v.label}</div>
+        <div className={"rounded-xl border px-5 py-4 " + v.color}>
+          <div className="font-bold text-base mb-1">{v.label} {v.emoji}</div>
           <div className="text-xs opacity-80">{v.desc}</div>
-          {posWarn() && <div className="mt-2 text-xs font-medium opacity-90">{posWarn()}</div>}
+          {warn && <div className="mt-2 text-xs font-medium opacity-90">Warning: {warn}</div>}
           <div className="mt-2 flex gap-4 text-xs opacity-70">
-            <span>Production edge: {prodAdv >= 0 ? "+" : ""}{prodAdv.toFixed(0)} pts ({prodAdv >= 0 ? "FA" : "Current"})</span>
-            <span>Dynasty edge: {dsAdv >= 0 ? "+" : ""}{dsAdv.toFixed(0)} pts ({dsAdv >= 0 ? "FA" : "Current"})</span>
+            <span>Production edge: {prodAdv >= 0 ? "+" : ""}{prodAdv.toFixed(0)} ({prodAdv >= 0 ? "FA" : "Current"})</span>
+            <span>Dynasty edge: {dsAdv >= 0 ? "+" : ""}{dsAdv.toFixed(0)} ({dsAdv >= 0 ? "FA" : "Current"})</span>
           </div>
         </div>
       )}
@@ -2273,9 +2291,13 @@ function TradeSearch({ dir, excludedNames, onAdd, placeholder }) {
               <div className="min-w-0 flex-1">
                 <span className="font-semibold text-sm text-gray-900">{p.name}</span>
                 <span className="text-xs text-gray-400 ml-2">{p.team} · Age {p.age||"?"}</span>
-                {p.isMinors && <span className="ml-1.5 text-xs bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded-full font-semibold">AAA</span>}
+                {p.isMinors && (
+                  <span className="ml-1.5 text-xs bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded-full font-semibold">
+                    {p.levelLabel || "MiLB"}
+                  </span>
+                )}
               </div>
-              <span className="text-xs text-gray-400 shrink-0">{(p.fpAvg||0).toFixed(1)} pts/gm</span>
+              <span className="text-xs text-gray-400 shrink-0">{p.fpAvg > 0 ? `${p.fpAvg.toFixed(1)} pts/gm` : "No stats yet"}</span>
             </button>
           ))}
         </div>
@@ -2315,7 +2337,7 @@ function TradePlayerCard({ player, onRemove }) {
             <span className="font-semibold text-gray-700">{(player.fpAvg||0).toFixed(1)}</span> pts/gm
             <span className="mx-1.5 text-gray-200">·</span>
             Dynasty <span className="font-semibold text-gray-700">{ds}</span>/100
-            {player.isMinors && <span className="ml-2 bg-purple-100 text-purple-700 text-xs px-1.5 py-0.5 rounded-full font-semibold">AAA</span>}
+            {player.isMinors && <span className="ml-2 bg-purple-100 text-purple-700 text-xs px-1.5 py-0.5 rounded-full font-semibold">{player.levelLabel || "MiLB"}</span>}
             {!player.isMinors && player.isProspect && <span className="ml-2 bg-emerald-100 text-emerald-700 text-xs px-1.5 py-0.5 rounded-full font-semibold">Prospect</span>}
           </div>
         </div>
@@ -2650,8 +2672,8 @@ function TradeTab({ roster, league }) {
           <div>
             <h3 className="font-bold text-gray-800 text-sm">🌐 Load Player Directory for Trade Search</h3>
             <p className="text-xs text-gray-500 mt-0.5">
-              Pulls live MLB + AAA stats so you can search any player by name on either side of the trade.
-              {roster && " Your current roster players are already available without loading."}
+              Pulls every rostered player across MLB, AAA, AA, High-A, and Low-A — so you can search anyone on either side of a trade, including deep prospects.
+              {roster && " Your current roster players are already searchable without loading."}
             </p>
             {dirError && <p className="text-xs text-red-600 mt-1">⚠ {dirError}</p>}
           </div>
@@ -2670,7 +2692,7 @@ function TradeTab({ roster, league }) {
       )}
       {dirLoaded && (
         <div className="bg-green-50 border border-green-200 rounded-xl px-4 py-2.5 flex items-center justify-between">
-          <p className="text-xs text-green-700 font-semibold">✓ Directory loaded — {mlbDir.length.toLocaleString()} MLB + AAA players searchable</p>
+          <p className="text-xs text-green-700 font-semibold">✓ Directory loaded — {mlbDir.length.toLocaleString()} players searchable (MLB · AAA · AA · High-A · Low-A)</p>
           <button onClick={loadDirectory} disabled={dirLoading} className="text-xs text-green-600 hover:underline">{dirLoading?"Refreshing…":"Refresh"}</button>
         </div>
       )}
