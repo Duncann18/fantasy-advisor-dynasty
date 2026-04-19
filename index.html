@@ -1,0 +1,3018 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Fantasy Roster Advisor ⚾</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; margin: 0; }
+    * { box-sizing: border-box; }
+    input[type=number]::-webkit-inner-spin-button { opacity: 1; }
+    .star-full  { color: #f59e0b; }
+    .star-empty { color: #d1d5db; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+/* ═══════════════════════════════════════════════════════════════
+   FANTASY ROSTER ADVISOR  — Dynasty Edition
+   ───────────────────────────────────────────────────────────────
+   HOW TO EDIT:
+   • Open in any text editor → change values below → refresh browser
+   • Or use the in-app ⚙ Settings panel (no code needed)
+   ═══════════════════════════════════════════════════════════════ */
+
+const { useState, useMemo, useRef, useCallback } = React;
+
+/* ── LEAGUE CONFIG ─────────────────────────────────────────────
+   Change these to match your league settings.
+   ─────────────────────────────────────────────────────────────*/
+const DEFAULT_LEAGUE = {
+  name:          "Dynasty Field of Dreams S4",
+  platform:      "Fantrax",
+  scoring:       "H2H Points · Median (14 teams)",
+  maxStarts:     10,         // max pitching starts per week
+  maxSaves:      10,         // max saves per week
+  totalFaab:     200,        // $200 season FAAB budget (Fantrax rules)
+  remainingFaab: 200,        // ← update this each week as you spend
+  activeSlots:   { C:1, "1B":1, "2B":1, "3B":1, SS:1, INF:1, OF:4, UT:2, SP:5, RP:1, P:3 },
+  // Roster limits: 21 active / 28 reserve / 15 IR / 29 minors (min 10) / 50 total
+  // Season: Mar 25 – Sep 27, 2026 · Playoffs: Period 25 (Sep 21–27)
+  // FAAB bids processed: Sun, Mon, Wed at midnight EDT · Min bid $1
+  // Trade deadline: Sep 27, 2026 · Lineup locks: Weekly every Monday
+};
+
+/* ── PERFORMANCE BENCHMARKS (avg pts/game) ─────────────────────
+   Below 55% of these = flagged as underperforming.
+   Raise numbers to be stricter; lower to be more lenient.
+   ─────────────────────────────────────────────────────────────*/
+const BENCHMARKS = {
+  hitter:  { C:2.0, "1B":2.5, "2B":2.5, "3B":2.5, SS:2.5, OF:2.5, INF:2.5, UT:2.0 },
+  pitcher: { SP:8.0, RP:3.5, P:8.0 },
+};
+
+/* ── DYNASTY AGE TIERS ─────────────────────────────────────────
+   Used to compute long-term dynasty value for any player.
+   ─────────────────────────────────────────────────────────────*/
+const DYNASTY_AGE = [
+  { max: 22, label: "Elite Prospect",  stars: 5, score: 50, color: "text-emerald-600",  badge: "bg-emerald-100 text-emerald-800" },
+  { max: 25, label: "Prime Upside",    stars: 4, score: 38, color: "text-blue-600",     badge: "bg-blue-100 text-blue-800"      },
+  { max: 27, label: "Peak Years",      stars: 3, score: 25, color: "text-indigo-600",   badge: "bg-indigo-100 text-indigo-800"  },
+  { max: 30, label: "Declining Asset", stars: 2, score: 12, color: "text-yellow-600",   badge: "bg-yellow-100 text-yellow-800"  },
+  { max: 99, label: "Rental/Win-Now",  stars: 1, score: 4,  color: "text-red-500",      badge: "bg-red-100 text-red-700"        },
+];
+
+const MIN_GP_HITTER  = 5;
+const MIN_GP_PITCHER = 2;
+
+/* ═══════════════════════════════════════════════════════════════
+   CSV PARSING  (Fantrax "Team Roster" export)
+   ═══════════════════════════════════════════════════════════════ */
+function parseCSVLine(line) {
+  const out = []; let cur = ""; let inQ = false;
+  for (const ch of line) {
+    if (ch === '"') inQ = !inQ;
+    else if (ch === ',' && !inQ) { out.push(cur.trim()); cur = ""; }
+    else cur += ch;
+  }
+  out.push(cur.trim());
+  return out;
+}
+function col(cols, headers, key) {
+  const i = headers.indexOf(key);
+  return i >= 0 ? (cols[i] || "").replace(/"/g, "").trim() : "";
+}
+
+function parseFantraxCSV(text) {
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const hitters = [], pitchers = [];
+  let section = null, hHdr = null, pHdr = null;
+
+  for (const line of lines) {
+    const cols  = parseCSVLine(line);
+    const clean = cols.map(c => c.replace(/"/g, "").trim());
+
+    // Section header — "Hitting" or "Pitching" appears in any cell
+    if (clean.some(c => c === "Hitting"))  { section = "hitting";  continue; }
+    if (clean.some(c => c === "Pitching")) { section = "pitching"; continue; }
+
+    // Column header row — first non-empty cell is "ID", or row has both "Player" and "Team"
+    const firstVal = clean.find(c => c) || "";
+    if (firstVal === "ID" || (clean.includes("Player") && clean.includes("Team"))) {
+      if (section === "hitting")        hHdr = clean;
+      else if (section === "pitching")  pHdr = clean;
+      else                              { hHdr = clean; pHdr = clean; }
+      continue;
+    }
+
+    if (!section || !clean[0]) continue;
+    const hdr = section === "hitting" ? hHdr : pHdr;
+    if (!hdr) continue;
+
+    // col() — exact match by column name
+    const g = k => col(cols, hdr, k);
+
+    const base = {
+      id:         clean[0],
+      name:       g("Player"),
+      team:       g("Team"),
+      pos:        g("Pos"),
+      eligible:   g("Eligible"),
+      status:     g("Status"),
+      age:        parseInt(g("Age"))                                    || 0,
+      fpTotal:    parseFloat(g("Fantasy Points"))                       || 0,
+      fpAvg:      parseFloat(g("Average Fantasy Points per Game"))      || 0,
+      gp:         parseInt(g("GP"))                                     || 0,
+      isProspect: false,
+    };
+    if (!base.name) continue;
+
+    if (section === "hitting" && hHdr) {
+      hitters.push({ ...base, type:"hitter",
+        hr:  parseInt(g("HR"))  || 0,
+        sb:  parseInt(g("SB"))  || 0,
+        rbi: parseInt(g("RBI")) || 0,
+        r:   parseInt(g("R"))   || 0,
+        bb:  parseInt(g("BB"))  || 0,
+        so:  parseInt(g("SO"))  || 0,
+        h:   parseInt(g("H"))   || 0,
+        ab:  parseInt(g("AB"))  || 0,
+      });
+    } else if (section === "pitching" && pHdr) {
+      pitchers.push({ ...base, type:"pitcher",
+        ip:  parseFloat(g("IP"))  || 0,
+        era: parseFloat(g("ERA")) || 0,
+        k:   parseInt(g("K"))     || 0,
+        w:   parseInt(g("W"))     || 0,
+        sv:  parseInt(g("SV"))    || 0,
+        hld: parseInt(g("HLD"))   || 0,
+        qs:  parseInt(g("QS"))    || 0,
+      });
+    }
+  }
+
+  return { hitters, pitchers, all:[...hitters,...pitchers] };
+}
+
+/* ── FANTRAX "Players → Free Agents" CSV parser ───────────────
+   Different format from the roster export:
+   • Flat list — no Hitting/Pitching section headers
+   • Columns: ID, Player, Team, Position, RkOv, Status, Age,
+              FPts, FP/G, Ros, +/-
+   • Position is comma-separated eligible list ("2B,3B,SS,INF,OF")
+   • Status can contain HTML snippets ("W <small>(Sat)</small>")
+   • Minor leaguers appear as team = "(N/A)"
+   • No per-stat columns (HR, SB, IP, etc.) — defaults 0
+   ─────────────────────────────────────────────────────────────*/
+function parseFantraxFACSV(text) {
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  if (lines.length < 2) return [];
+
+  const headerCols = parseCSVLine(lines[0]).map(h => h.replace(/"/g, "").trim());
+  const g = (rowCols, key) => col(rowCols, headerCols, key);
+
+  const HITTER_POS = ["C","1B","2B","3B","SS","OF"];
+  const players = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    const rowCols = parseCSVLine(lines[i]);
+    const name = g(rowCols, "Player");
+    if (!name) continue;
+
+    // Strip any inline HTML from Status (e.g. "W <small>(Sat)</small>")
+    const rawStatus = g(rowCols, "Status").replace(/<[^>]+>/g, "").trim();
+
+    const posStr  = g(rowCols, "Position") || g(rowCols, "Pos") || "";
+    const posList = posStr.split(",").map(s => s.trim()).filter(Boolean);
+
+    const isPitcher = posList.some(p => ["SP","RP","P"].includes(p));
+    const primaryPos = isPitcher
+      ? (posList.find(p => p === "SP") || posList.find(p => p === "RP") || "SP")
+      : (HITTER_POS.find(hp => posList.includes(hp)) || posList[0] || "OF");
+
+    const age      = parseInt(g(rowCols, "Age"))   || 0;
+    const fpTotal  = parseFloat(g(rowCols, "FPts")) || 0;
+    const fpAvg    = parseFloat(g(rowCols, "FP/G")) || 0;
+    const gp       = (fpAvg > 0 && fpTotal > 0) ? Math.max(1, Math.round(fpTotal / fpAvg)) : 0;
+    const rawId    = (g(rowCols, "ID") || name).replace(/\*/g, "").trim();
+    const team     = g(rowCols, "Team") || "?";
+
+    // Minor leaguers: Fantrax shows team as "(N/A)" for unsigned/MiLB players
+    const isMinors   = team === "(N/A)" || rawStatus === "Min";
+    const isProspect = isMinors || (age > 0 && age <= 23);
+
+    players.push({
+      id:         rawId || name,
+      name,
+      team:       isMinors ? "MiLB" : team,
+      pos:        primaryPos,
+      eligible:   posStr,
+      status:     "FA",
+      age, isProspect, isMinors,
+      fpTotal, fpAvg, gp,
+      type:       isPitcher ? "pitcher" : "hitter",
+      // Detailed stats not in this export — leave at 0
+      hr:0, sb:0, rbi:0, r:0, bb:0, so:0, h:0, ab:0,
+      ip:0, era:0, k:0, w:0, sv:0, hld:0, qs:0,
+    });
+  }
+
+  return players;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   DYNASTY SCORING
+   ═══════════════════════════════════════════════════════════════ */
+function ageTier(age) {
+  return DYNASTY_AGE.find(t => age <= t.max) || DYNASTY_AGE[DYNASTY_AGE.length-1];
+}
+
+function dynastyScore(player) {
+  const tier    = ageTier(player.age || 25);
+  const agePts  = tier.score;
+
+  const bmkMap  = player.type === "hitter" ? BENCHMARKS.hitter : BENCHMARKS.pitcher;
+  const bmk     = bmkMap[player.pos] || (player.type==="hitter" ? 2.5 : 8.0);
+  const prodPts = Math.min(35, (player.fpAvg / bmk) * 20);
+
+  const prosPts = player.isProspect ? 15 : 0;
+  const savePts = (player.type === "pitcher" && player.sv > 0) ? 5 : 0;
+
+  return Math.min(100, Math.round(agePts + prodPts + prosPts + savePts));
+}
+
+function Stars({ n, max = 5 }) {
+  return (
+    <span className="text-sm">
+      {Array.from({length: max}).map((_,i) =>
+        <span key={i} className={i < n ? "star-full" : "star-empty"}>★</span>
+      )}
+    </span>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   TEAM NEEDS ANALYSIS
+   ═══════════════════════════════════════════════════════════════ */
+function eligibleFor(player, slotPos) {
+  const elig = player.eligible ? player.eligible.split(",").map(s=>s.trim()) : [player.pos];
+  if (slotPos==="INF") return elig.some(e=>["1B","2B","3B","SS","C"].includes(e));
+  if (slotPos==="UT")  return player.type==="hitter";
+  if (slotPos==="P")   return player.type==="pitcher";
+  return elig.includes(slotPos) || player.pos===slotPos;
+}
+function canFillSlot(candidate, activePlayer) {
+  return candidate.type===activePlayer.type && eligibleFor(candidate, activePlayer.pos);
+}
+
+function analyzeNeeds(roster) {
+  if (!roster) return { positionNeeds: [], categoryNeeds: [] };
+  const { all, hitters, pitchers } = roster;
+  const active = all.filter(p => p.status === "Act");
+  const activeH = active.filter(p => p.type === "hitter");
+  const activeP = active.filter(p => p.type === "pitcher");
+  const needs = [];
+
+  // Position needs
+  const hPositions = ["C","1B","2B","3B","SS","OF"];
+  for (const pos of hPositions) {
+    const slot = activeH.filter(p => eligibleFor(p, pos));
+    const avgAtPos = slot.length > 0 ? slot.reduce((t,p)=>t+p.fpAvg,0)/slot.length : 0;
+    const bmk = BENCHMARKS.hitter[pos] || 2.5;
+    if (avgAtPos < bmk * 0.7 || slot.length === 0) {
+      needs.push({ pos, type:"hitter", label: pos, avgAtPos, bmk,
+        severity: avgAtPos < bmk * 0.45 || slot.length===0 ? "critical" : "moderate",
+        note: slot.length===0 ? "No eligible player" : `${avgAtPos.toFixed(1)}/gm avg`,
+      });
+    }
+  }
+
+  // Saves need
+  const hasSaves = activeP.some(p => p.pos==="RP" && p.sv > 0);
+  if (!hasSaves) needs.push({ pos:"RP", type:"pitcher", label:"Saves (RP)", avgAtPos:0, bmk:BENCHMARKS.pitcher.RP, severity:"critical", note:"No active closer" });
+
+  // SP depth need
+  const activeSPs = activeP.filter(p => p.pos==="SP" || p.pos==="P");
+  const avgSP = activeSPs.length>0 ? activeSPs.reduce((t,p)=>t+p.fpAvg,0)/activeSPs.length : 0;
+  if (avgSP < BENCHMARKS.pitcher.SP * 0.7) {
+    needs.push({ pos:"SP", type:"pitcher", label:"Starting Pitching", avgAtPos:avgSP, bmk:BENCHMARKS.pitcher.SP, severity: avgSP < BENCHMARKS.pitcher.SP*0.45 ? "critical":"moderate", note:`${avgSP.toFixed(1)}/gm avg` });
+  }
+
+  // Category analysis (from actual stat rates)
+  const catNeeds = [];
+  const totalGP = activeH.reduce((t,p)=>t+p.gp,0)||1;
+  const hrPer = activeH.reduce((t,p)=>t+p.hr,0)/totalGP;
+  const sbPer = activeH.reduce((t,p)=>t+p.sb,0)/totalGP;
+  const rbiPer= activeH.reduce((t,p)=>t+p.rbi,0)/totalGP;
+  const bbPer = activeH.reduce((t,p)=>t+p.bb,0)/totalGP;
+
+  if (hrPer  < 0.25) catNeeds.push({ cat:"HR Power",   rate:`${hrPer.toFixed(2)}/gm`,  severity:"high",   icon:"💥" });
+  if (sbPer  < 0.15) catNeeds.push({ cat:"Speed/SB",   rate:`${sbPer.toFixed(2)}/gm`,  severity:"medium", icon:"⚡" });
+  if (rbiPer < 0.50) catNeeds.push({ cat:"RBI",        rate:`${rbiPer.toFixed(2)}/gm`, severity:"medium", icon:"🏠" });
+  if (bbPer  < 0.25) catNeeds.push({ cat:"BB / OBP",   rate:`${bbPer.toFixed(2)}/gm`,  severity:"low",    icon:"👁" });
+
+  const ipTotal   = activeP.reduce((t,p)=>t+p.ip,0)||1;
+  const kPer9     = (activeP.reduce((t,p)=>t+p.k,0)/ipTotal)*9;
+  const totalSV   = activeP.reduce((t,p)=>t+p.sv,0);
+  const totalQS   = activeP.reduce((t,p)=>t+p.qs,0);
+  const totalStart= activeP.filter(p=>p.pos==="SP").reduce((t,p)=>t+p.gp,0)||1;
+
+  if (kPer9    < 7.5) catNeeds.push({ cat:"Strikeouts", rate:`${kPer9.toFixed(1)} K/9`,      severity:"medium", icon:"🔥" });
+  if (totalSV  < 2)   catNeeds.push({ cat:"Saves",      rate:`${totalSV} total`,              severity:"high",   icon:"🔒" });
+  if (totalQS/totalStart < 0.35) catNeeds.push({ cat:"Quality Starts", rate:`${totalQS} QS`,  severity:"medium", icon:"🎯" });
+
+  return { positionNeeds: needs, categoryNeeds: catNeeds };
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   FA FIT SCORING
+   ═══════════════════════════════════════════════════════════════ */
+function faFitScore(fa, posNeeds, catNeeds, active) {
+  let score = 0;
+  const breakdown = [];
+
+  // 1. Position need fit (max 40)
+  const filledNeeds = posNeeds.filter(n => n.type === fa.type && eligibleFor(fa, n.pos));
+  if (filledNeeds.length > 0) {
+    const topNeed = filledNeeds.sort((a,b) => a.avgAtPos - b.avgAtPos)[0];
+    const pts = topNeed.severity === "critical" ? 40 : 22;
+    score += pts;
+    breakdown.push({ label:`Fills ${topNeed.label} need`, pts, positive:true });
+  } else {
+    breakdown.push({ label:"No position need filled", pts:0, positive:false });
+  }
+
+  // 2. Production vs active roster (max 20)
+  const peers = active.filter(ap => ap.type===fa.type && canFillSlot(fa, ap)).sort((a,b)=>a.fpAvg-b.fpAvg);
+  const worst = peers[0];
+  if (worst && fa.fpAvg > worst.fpAvg) {
+    const gain = Math.min(20, Math.round((fa.fpAvg - worst.fpAvg) * 3));
+    score += gain;
+    breakdown.push({ label:`Upgrades ${worst.name} (${worst.fpAvg.toFixed(1)} → ${fa.fpAvg.toFixed(1)})`, pts:gain, positive:true });
+  } else if (worst) {
+    breakdown.push({ label:`Worse than ${worst.name} (${worst.fpAvg.toFixed(1)}/gm active)`, pts:0, positive:false });
+  }
+
+  // 3. Dynasty age value (max 25)
+  const tier = ageTier(fa.age || 25);
+  const agePts = Math.round((tier.score / 50) * 25);
+  score += agePts;
+  breakdown.push({ label:`Age ${fa.age || "?"}: ${tier.label}`, pts: agePts, positive: agePts >= 12 });
+
+  // 4. Prospect bonus (max 15)
+  if (fa.isProspect) {
+    score += 15;
+    breakdown.push({ label:"Prospect — long-term dynasty asset", pts:15, positive:true });
+  }
+
+  // 5. Category need bonus (max 10)
+  let catMatch = false;
+  if (fa.type === "hitter") {
+    if (fa.hr > 0 && catNeeds.some(c=>c.cat==="HR Power"))  { score += 5; catMatch = true; }
+    if (fa.sb > 0 && catNeeds.some(c=>c.cat==="Speed/SB"))  { score += 5; catMatch = true; }
+  } else {
+    if (fa.sv > 0 && catNeeds.some(c=>c.cat==="Saves"))     { score += 10; catMatch = true; }
+    if (fa.qs > 0 && catNeeds.some(c=>c.cat==="Quality Starts")) { score += 5; catMatch = true; }
+    if (fa.k  > 0 && catNeeds.some(c=>c.cat==="Strikeouts")) { score += 3; catMatch = true; }
+  }
+  if (catMatch) breakdown.push({ label:"Fills a category weakness", pts:5, positive:true });
+
+  return { score: Math.min(100, Math.round(score)), breakdown };
+}
+
+function faVerdict(fitScore, dynastyScore) {
+  const combined = fitScore * 0.65 + dynastyScore * 0.35;
+  if (combined >= 68) return { label:"Strong Add",        color:"bg-green-600 text-white",   emoji:"✅" };
+  if (combined >= 48) return { label:"Consider",          color:"bg-blue-600 text-white",    emoji:"🔵" };
+  if (combined >= 30) return { label:"Dynasty Stash",     color:"bg-indigo-500 text-white",  emoji:"📦" };
+  return                     { label:"Pass",              color:"bg-gray-400 text-white",    emoji:"❌" };
+}
+
+function suggestedBid(fitScore, dynastyVal, remainingFaab) {
+  let pct;
+  if (fitScore >= 75)      pct = 0.22;
+  else if (fitScore >= 55) pct = 0.13;
+  else if (fitScore >= 35) pct = 0.06;
+  else                     pct = 0.02;
+  // Dynasty upside multiplier
+  if (dynastyVal >= 80)      pct *= 1.4;
+  else if (dynastyVal >= 60) pct *= 1.2;
+  return Math.max(1, Math.round(remainingFaab * pct));
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SUGGESTION ENGINE (roster)
+   ═══════════════════════════════════════════════════════════════ */
+function generateSuggestions(hitters, pitchers) {
+  const all = [...hitters,...pitchers];
+  const active=all.filter(p=>p.status==="Act"), reserve=all.filter(p=>p.status==="Res"), ir=all.filter(p=>p.status==="IR");
+  const sugs = [];
+  const order = { critical:0, high:1, medium:2, low:3 };
+
+  for (const ap of active) {
+    if (ap.gp===0) continue;
+    const bmkMap=ap.type==="hitter"?BENCHMARKS.hitter:BENCHMARKS.pitcher;
+    const bmk=bmkMap[ap.pos]||(ap.type==="hitter"?2.5:8.0);
+    const minGP=ap.type==="hitter"?MIN_GP_HITTER:MIN_GP_PITCHER;
+    if (ap.fpAvg < bmk*0.55 && ap.gp>=minGP) {
+      const upgrades=reserve.filter(r=>r.type===ap.type&&r.gp>=(ap.type==="hitter"?3:2)&&r.fpAvg>ap.fpAvg&&canFillSlot(r,ap)).sort((a,b)=>b.fpAvg-a.fpAvg);
+      const priority=ap.fpAvg<bmk*0.33?"critical":"high";
+      if (upgrades.length>0) {
+        sugs.push({ id:`swap-${ap.id}`, priority, category:"swap", headline:`Bench ${ap.name} → Activate ${upgrades[0].name}`, rationale:`${ap.name} averaging ${ap.fpAvg.toFixed(2)}/gm (${ap.gp} GP) — far below the ${bmk} benchmark. ${upgrades[0].name} is sitting on your bench averaging ${upgrades[0].fpAvg.toFixed(2)}/gm.`, bench:ap, activate:upgrades[0] });
+      } else {
+        sugs.push({ id:`flag-${ap.id}`, priority:"medium", category:"waiver", headline:`${ap.name} underperforming — check waiver wire`, rationale:`${ap.name} averaging ${ap.fpAvg.toFixed(2)}/gm (${ap.gp} GP) with no bench upgrade available. Use the FA Analyzer tab to find a replacement.`, bench:ap, activate:null });
+      }
+    }
+  }
+  for (const rp of reserve) {
+    if (rp.gp<3||rp.fpAvg===0) continue;
+    const already=sugs.some(s=>s.activate?.id===rp.id);
+    if (already) continue;
+    const peers=active.filter(ap=>canFillSlot(rp,ap)&&ap.gp>=3);
+    const worst=peers.sort((a,b)=>a.fpAvg-b.fpAvg)[0];
+    if (worst && rp.fpAvg>worst.fpAvg*1.5) {
+      sugs.push({ id:`upgrade-${rp.id}`, priority:"medium", category:"swap", headline:`${rp.name} outperforming ${worst.name} — swap them`, rationale:`${rp.name} (bench ${rp.fpAvg.toFixed(2)}/gm) > ${worst.name} (active ${worst.fpAvg.toFixed(2)}/gm). Both fit the ${worst.pos} slot.`, bench:worst, activate:rp });
+    }
+  }
+  for (const ap of active) {
+    if (ap.gp===0) sugs.push({ id:`nogp-${ap.id}`, priority:"medium", category:"monitor", headline:`${ap.name} active but has 0 GP — verify status`, rationale:`${ap.name} (${ap.team}, ${ap.pos}) is on your active roster but hasn't logged a game yet. Confirm they're in their team's lineup before Monday's lock.`, bench:null, activate:ap });
+  }
+  if (!active.some(p=>p.type==="pitcher"&&p.pos==="RP")) {
+    sugs.push({ id:"no-saves", priority:"high", category:"waiver", headline:"No active closer — use FA Analyzer to find one", rationale:"Saves are worth +6 pts each. Check the FA Analyzer tab to evaluate available closers.", bench:null, activate:null });
+  }
+  for (const p of ir) sugs.push({ id:`ir-${p.id}`, priority:"low", category:"monitor", headline:`Plan ahead: ${p.name} is on IL/IR`, rationale:`${p.name} (${p.team}, ${p.pos}) on injured reserve. When their MLB team activates them, clear a spot in advance.`, bench:null, activate:p });
+  for (const rp of reserve) {
+    if (rp.gp===0&&rp.fpTotal===0&&rp.type==="pitcher") sugs.push({ id:`zerores-${rp.id}`, priority:"low", category:"monitor", headline:`${rp.name} (reserve) has 0 IP — confirm active`, rationale:`${rp.name} (${rp.team}) hasn't pitched yet. Verify their MLB roster status.`, bench:null, activate:rp });
+  }
+  return sugs.sort((a,b)=>order[a.priority]-order[b.priority]);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   UI HELPERS
+   ═══════════════════════════════════════════════════════════════ */
+const PRIORITY_CARD  = { critical:"border-l-4 border-red-500 bg-red-50", high:"border-l-4 border-orange-400 bg-orange-50", medium:"border-l-4 border-yellow-400 bg-yellow-50", low:"border-l-4 border-gray-300 bg-gray-50" };
+const PRIORITY_BADGE = { critical:"bg-red-500 text-white", high:"bg-orange-400 text-white", medium:"bg-yellow-400 text-gray-800", low:"bg-gray-200 text-gray-600" };
+const CAT_ICON = { swap:"🔄", waiver:"📋", monitor:"👁" };
+
+function posColor(pos) {
+  if (["SP","RP","P"].includes(pos)) return "bg-indigo-100 text-indigo-800";
+  if (pos==="C")  return "bg-purple-100 text-purple-800";
+  if (pos==="OF") return "bg-emerald-100 text-emerald-800";
+  return "bg-amber-100 text-amber-800";
+}
+
+function AvgBar({ avg, pos, type }) {
+  const bmk   = type==="hitter"?(BENCHMARKS.hitter[pos]||2.5):(BENCHMARKS.pitcher[pos]||8.0);
+  const pct   = Math.min(100,(avg/(bmk*1.5))*100);
+  const color = avg>=bmk?"bg-green-500":avg>=bmk*0.6?"bg-yellow-400":"bg-red-500";
+  const txt   = avg>=bmk?"text-green-700":avg>=bmk*0.6?"text-yellow-700":"text-red-600";
+  return (
+    <div className="flex items-center gap-2">
+      <span className={`text-xs font-bold w-8 ${txt}`}>{avg>0?avg.toFixed(1):"—"}</span>
+      <div className="w-12 h-1.5 bg-gray-200 rounded-full overflow-hidden">
+        <div className={`h-full rounded-full ${color}`} style={{width:`${pct}%`}}/>
+      </div>
+    </div>
+  );
+}
+
+function FaabBar({ remaining, total }) {
+  const pct = total>0 ? Math.min(100,(remaining/total)*100) : 0;
+  const color = pct>50?"bg-green-500":pct>20?"bg-yellow-400":"bg-red-500";
+  return (
+    <div>
+      <div className="flex justify-between text-xs mb-1">
+        <span className="text-slate-300">FAAB Remaining</span>
+        <span className="text-white font-bold">${remaining.toLocaleString()} / ${total.toLocaleString()}</span>
+      </div>
+      <div className="h-2 bg-slate-700 rounded-full overflow-hidden">
+        <div className={`h-full rounded-full ${color}`} style={{width:`${pct}%`}}/>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SETTINGS PANEL
+   ═══════════════════════════════════════════════════════════════ */
+function SettingsPanel({ league, onChange, onClose }) {
+  const [d, setD] = useState({...league});
+  const set = (k,v) => setD(p=>({...p,[k]:v}));
+  return (
+    <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto" onClick={e=>e.stopPropagation()}>
+        <div className="flex items-center justify-between px-6 py-4 border-b sticky top-0 bg-white">
+          <h2 className="font-bold text-gray-800">⚙ League Settings</h2>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
+        </div>
+        <div className="px-6 py-5 space-y-4">
+          {[{k:"name",label:"League Name"},{k:"platform",label:"Platform"},{k:"scoring",label:"Scoring Format"}].map(({k,label})=>(
+            <div key={k}><label className="text-xs font-semibold text-gray-600 block mb-1">{label}</label>
+              <input className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-400" value={d[k]} onChange={e=>set(k,e.target.value)}/></div>
+          ))}
+          <div className="grid grid-cols-2 gap-4">
+            {[{k:"maxStarts",label:"Max Starts/Week"},{k:"maxSaves",label:"Max Saves/Week"},{k:"totalFaab",label:"Total FAAB Budget ($)"},{k:"remainingFaab",label:"Remaining FAAB ($)"}].map(({k,label})=>(
+              <div key={k}><label className="text-xs font-semibold text-gray-600 block mb-1">{label}</label>
+                <input type="number" min="0" className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-400" value={d[k]} onChange={e=>set(k,parseInt(e.target.value)||0)}/></div>
+            ))}
+          </div>
+          <div><label className="text-xs font-semibold text-gray-600 block mb-2">Active Lineup Slots</label>
+            <div className="grid grid-cols-4 gap-2">
+              {Object.entries(d.activeSlots).map(([pos,n])=>(
+                <div key={pos} className="flex items-center gap-1.5">
+                  <span className={`text-xs font-bold px-1.5 py-0.5 rounded-full ${posColor(pos)}`}>{pos}</span>
+                  <input type="number" min="0" max="10" className="w-10 border rounded px-1 py-0.5 text-xs focus:outline-none focus:border-blue-400" value={n}
+                    onChange={e=>setD(d=>({...d,activeSlots:{...d.activeSlots,[pos]:parseInt(e.target.value)||0}}))}/>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+        <div className="px-6 py-4 border-t flex justify-end gap-3">
+          <button onClick={onClose} className="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded-lg">Cancel</button>
+          <button onClick={()=>{onChange(d);onClose();}} className="px-5 py-2 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium">Save</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SUGGESTION CARD
+   ═══════════════════════════════════════════════════════════════ */
+function PlayerMini({ player, label, accent }) {
+  const border = accent==="red"?"border-red-200 bg-red-50":"border-green-200 bg-green-50";
+  const hdr    = accent==="red"?"text-red-700":"text-green-700";
+  const tier   = ageTier(player.age||25);
+  return (
+    <div className={`rounded-lg border ${border} p-3 text-xs`}>
+      <div className={`font-bold uppercase tracking-wide mb-2 ${hdr}`}>{label}</div>
+      <div className="flex items-center gap-1.5 flex-wrap mb-1.5">
+        <span className={`font-bold px-1.5 py-0.5 rounded-full ${posColor(player.pos)}`}>{player.pos}</span>
+        <span className="font-semibold text-gray-800">{player.name}</span>
+        <span className="text-gray-400">{player.team}</span>
+      </div>
+      <div className="text-gray-500 space-y-0.5">
+        <div className="flex items-center gap-1">Avg/gm: <AvgBar avg={player.fpAvg} pos={player.pos} type={player.type}/></div>
+        <div>Total: <strong>{player.fpTotal.toFixed(1)} pts</strong> · {player.gp} GP · Age {player.age}</div>
+        <div className="flex items-center gap-1"><Stars n={tier.stars}/><span className={`text-xs ${tier.color}`}>{tier.label}</span></div>
+      </div>
+    </div>
+  );
+}
+
+function SuggestionCard({ s }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className={`rounded-xl shadow-sm overflow-hidden ${PRIORITY_CARD[s.priority]}`}>
+      <div className="px-5 py-4 cursor-pointer select-none" onClick={()=>setOpen(o=>!o)}>
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex items-start gap-3 flex-1 min-w-0">
+            <span className="text-lg leading-none mt-0.5">{CAT_ICON[s.category]}</span>
+            <div>
+              <div className="flex items-center gap-2 flex-wrap mb-1">
+                <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${PRIORITY_BADGE[s.priority]}`}>{s.priority.toUpperCase()}</span>
+                <span className="text-xs text-gray-400 capitalize">{s.category}</span>
+              </div>
+              <p className="font-semibold text-gray-900 text-sm">{s.headline}</p>
+            </div>
+          </div>
+          <span className="text-gray-400 text-xs shrink-0 mt-1">{open?"▲":"▼"}</span>
+        </div>
+      </div>
+      {open && (
+        <div className="px-5 pb-5 pt-0 border-t border-black/5">
+          <p className="text-gray-600 text-xs leading-relaxed my-3">{s.rationale}</p>
+          {(s.bench||s.activate) && (
+            <div className="grid grid-cols-2 gap-3">
+              {s.bench    && <PlayerMini player={s.bench}    label="Move to bench" accent="red"/>}
+              {s.activate && <PlayerMini player={s.activate} label="Activate"       accent="green"/>}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   ACTIVE GROUP TABLE
+   ═══════════════════════════════════════════════════════════════ */
+function ActiveGroup({ title, players, type, accentClass }) {
+  const sorted = [...players].sort((a,b)=>b.fpAvg-a.fpAvg);
+  const isPitcher = type==="pitcher";
+  return (
+    <div className="bg-white rounded-xl shadow overflow-hidden mb-4">
+      <div className={`px-4 py-2.5 border-b text-xs font-bold uppercase tracking-wide ${accentClass}`}>{title} ({players.length})</div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead className="bg-gray-50 text-gray-400 uppercase">
+            <tr>
+              <th className="px-4 py-2 text-left">Player</th>
+              <th className="px-3 py-2">Slot</th>
+              <th className="px-3 py-2">Avg/gm</th>
+              <th className="px-3 py-2">Dynasty</th>
+              <th className="px-3 py-2">Total</th>
+              <th className="px-3 py-2">GP</th>
+              {!isPitcher && <><th className="px-2 py-2">HR</th><th className="px-2 py-2">SB</th><th className="px-2 py-2">RBI</th></>}
+              {isPitcher  && <><th className="px-2 py-2">IP</th><th className="px-2 py-2">ERA</th><th className="px-2 py-2">K</th><th className="px-2 py-2">SV</th><th className="px-2 py-2">QS</th></>}
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-50">
+            {sorted.map((p,i)=>{
+              const bmk=isPitcher?(BENCHMARKS.pitcher[p.pos]||8):(BENCHMARKS.hitter[p.pos]||2.5);
+              const minGP=isPitcher?MIN_GP_PITCHER:MIN_GP_HITTER;
+              const bad=p.fpAvg<bmk*0.55&&p.gp>=minGP;
+              const ds=dynastyScore(p);
+              const tier=ageTier(p.age||25);
+              return (
+                <tr key={p.id} className={`${i%2===0?"":"bg-gray-50/40"}${bad?" bg-red-50/60":""}`}>
+                  <td className="px-4 py-2.5">
+                    <div className="font-semibold text-gray-800">{p.name}</div>
+                    <div className="text-gray-400 flex items-center gap-1">{p.team} · Age {p.age} · <Stars n={tier.stars}/></div>
+                  </td>
+                  <td className="px-3 py-2.5 text-center"><span className={`font-bold px-1.5 py-0.5 rounded-full ${posColor(p.pos)}`}>{p.pos}</span></td>
+                  <td className="px-3 py-2.5"><AvgBar avg={p.fpAvg} pos={p.pos} type={p.type}/></td>
+                  <td className="px-3 py-2.5 text-center">
+                    <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${tier.badge}`}>{ds}</span>
+                  </td>
+                  <td className="px-3 py-2.5 text-center font-semibold text-gray-700">{p.fpTotal.toFixed(1)}</td>
+                  <td className="px-3 py-2.5 text-center text-gray-500">{p.gp}</td>
+                  {!isPitcher&&<><td className="px-2 py-2.5 text-center">{p.hr||"—"}</td><td className="px-2 py-2.5 text-center">{p.sb||"—"}</td><td className="px-2 py-2.5 text-center">{p.rbi||"—"}</td></>}
+                  {isPitcher&&<><td className="px-2 py-2.5 text-center">{p.ip.toFixed(1)}</td><td className={`px-2 py-2.5 text-center font-semibold ${p.era>6?"text-red-500":p.era<3&&p.ip>0?"text-green-600":"text-gray-700"}`}>{p.ip>0?p.era.toFixed(2):"—"}</td><td className="px-2 py-2.5 text-center">{p.k||"—"}</td><td className="px-2 py-2.5 text-center font-bold text-purple-600">{p.sv||"—"}</td><td className="px-2 py-2.5 text-center text-blue-600">{p.qs||"—"}</td></>}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   FULL ROSTER TABLE
+   ═══════════════════════════════════════════════════════════════ */
+function RosterTable({ players, filter }) {
+  const groups = [
+    {key:"Act",label:"🟢 Active",   hdr:"text-green-700 bg-green-50 border-green-100"},
+    {key:"Res",label:"⚪ Reserve",  hdr:"text-gray-700 bg-gray-50 border-gray-100"},
+    {key:"IR", label:"🔴 IL / IR",  hdr:"text-red-700 bg-red-50 border-red-100"},
+    {key:"Min",label:"⬇ Minors",    hdr:"text-blue-700 bg-blue-50 border-blue-100"},
+  ];
+  const shown = filter==="all"?groups:groups.filter(g=>g.key===filter);
+  return (
+    <div className="space-y-4">
+      {shown.map(group=>{
+        const gp=players.filter(p=>p.status===group.key).sort((a,b)=>b.fpAvg-a.fpAvg);
+        if (gp.length===0) return null;
+        return (
+          <div key={group.key} className="bg-white rounded-xl shadow overflow-hidden">
+            <div className={`px-4 py-2 border-b text-xs font-bold uppercase tracking-wide ${group.hdr}`}>{group.label} ({gp.length})</div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead className="bg-gray-50 text-gray-400 uppercase">
+                  <tr><th className="px-4 py-2 text-left">Player</th><th className="px-3 py-2">Team</th><th className="px-3 py-2">Slot</th><th className="px-3 py-2">Eligible</th><th className="px-3 py-2">Age</th><th className="px-3 py-2">Dynasty</th><th className="px-3 py-2">Avg/gm</th><th className="px-3 py-2">Total</th><th className="px-3 py-2">GP</th></tr>
+                </thead>
+                <tbody className="divide-y divide-gray-50">
+                  {gp.map((p,i)=>{
+                    const ds=dynastyScore(p); const tier=ageTier(p.age||25);
+                    return (
+                      <tr key={p.id} className={i%2===0?"":"bg-gray-50/40"}>
+                        <td className="px-4 py-2.5 font-semibold text-gray-800">{p.name}</td>
+                        <td className="px-3 py-2.5 text-gray-500">{p.team}</td>
+                        <td className="px-3 py-2.5"><span className={`font-bold px-1.5 py-0.5 rounded-full ${posColor(p.pos)}`}>{p.pos}</span></td>
+                        <td className="px-3 py-2.5 text-gray-400 max-w-32 truncate">{p.eligible}</td>
+                        <td className="px-3 py-2.5 text-center text-gray-600">{p.age||"—"}</td>
+                        <td className="px-3 py-2.5 text-center"><span className={`text-xs font-bold px-2 py-0.5 rounded-full ${tier.badge}`}>{ds}</span></td>
+                        <td className="px-3 py-2.5"><AvgBar avg={p.fpAvg} pos={p.pos} type={p.type}/></td>
+                        <td className="px-3 py-2.5 font-semibold text-gray-700">{p.fpTotal>0?p.fpTotal.toFixed(1):"—"}</td>
+                        <td className="px-3 py-2.5 text-gray-500">{p.gp||"—"}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   FA ANALYZER TAB
+   ═══════════════════════════════════════════════════════════════ */
+const EMPTY_FA = { name:"", team:"", pos:"OF", age:"", isProspect:false,
+  fpAvg:"", gp:"", hr:"", sb:"", rbi:"", ip:"", era:"", k:"", sv:"", qs:"" };
+
+/* ── MLB STATS API HELPERS ─────────────────────────────────────
+   Uses the free, public MLB Stats API (statsapi.mlb.com).
+   sportId 1 = MLB majors, 11 = Triple-A, 12 = Double-A.
+   ─────────────────────────────────────────────────────────────*/
+const MLB_API = "https://statsapi.mlb.com/api/v1";
+const CURRENT_SEASON = new Date().getFullYear();
+
+function mapPos(abbr, gamesStarted, gamesPlayed) {
+  if (!abbr) return "OF";
+  const a = abbr.toUpperCase();
+  if (["LF","CF","RF"].includes(a)) return "OF";
+  if (["C","1B","2B","3B","SS","OF"].includes(a)) return a;
+  if (a === "SP") return "SP";
+  if (a === "RP") return "RP";
+  if (a === "P")  return (gamesStarted||0) / Math.max(gamesPlayed||1, 1) >= 0.45 ? "SP" : "RP";
+  return "OF";
+}
+
+function parseIP(ipStr) {
+  const [inn, outs] = String(ipStr||"0").split(".").map(Number);
+  return (inn||0) + (outs||0) / 3;
+}
+
+function calcHitterFP(st) {
+  const singles = (st.hits||0) - (st.doubles||0) - (st.triples||0) - (st.homeRuns||0);
+  return singles + (st.doubles||0)*2 + (st.triples||0)*3 + (st.homeRuns||0)*4
+    + (st.rbi||0) + (st.runs||0) + (st.baseOnBalls||0)
+    + (st.stolenBases||0)*2 + (st.caughtStealing||0)*-1
+    + (st.strikeOuts||0)*-0.5 + (st.hitByPitch||0);
+}
+
+function calcPitcherFP(st) {
+  const ip = parseIP(st.inningsPitched);
+  return ip*1.25 + (st.wins||0)*2 + (st.losses||0)*-1 + (st.earnedRuns||0)*-1
+    + (st.strikeOuts||0) + (st.saves||0)*6 + (st.holds||0)*2
+    + (st.qualityStarts||0)*6 + (st.shutouts||0)*3;
+}
+
+async function fetchMLBDirectory() {
+  const yr = CURRENT_SEASON;
+  // Fetch MLB + AAA hitting & pitching in parallel
+  const urls = [
+    `${MLB_API}/stats?stats=season&season=${yr}&group=hitting&sportId=1&playerPool=ALL&limit=2000`,
+    `${MLB_API}/stats?stats=season&season=${yr}&group=pitching&sportId=1&playerPool=ALL&limit=2000`,
+    `${MLB_API}/stats?stats=season&season=${yr}&group=hitting&sportId=11&playerPool=ALL&limit=2000`,
+    `${MLB_API}/stats?stats=season&season=${yr}&group=pitching&sportId=11&playerPool=ALL&limit=2000`,
+  ];
+  const results = await Promise.all(urls.map(u =>
+    fetch(u).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+  ));
+  const [mlbH, mlbP, aaaH, aaaP] = results;
+  const players = [];
+  const seen    = new Set();
+
+  // Process a batch of splits
+  function processSplits(data, type, isMinors) {
+    const splits = data?.stats?.[0]?.splits || [];
+    for (const s of splits) {
+      const pid  = s.player?.id;
+      const key  = `${pid}-${type}`;
+      if (!pid || seen.has(key)) continue;
+      seen.add(key);
+      const st   = s.stat || {};
+      const gp   = st.gamesPlayed || 1;
+      const gs   = st.gamesStarted || 0;
+      const posAbbr = s.position?.abbreviation || "";
+      const pos  = type === "hitter" ? mapPos(posAbbr, 0, gp) : mapPos(posAbbr, gs, gp);
+      const age  = s.player?.currentAge || 0;
+      const fp   = type === "hitter" ? calcHitterFP(st) : calcPitcherFP(st);
+      const fpAvg = gp > 0 ? Math.round((fp / gp) * 100) / 100 : 0;
+
+      const base = {
+        id: `mlb-${pid}-${type}`,
+        mlbId: pid,
+        name: s.player?.fullName || "Unknown",
+        team: s.team?.abbreviation || "?",
+        pos, type, age,
+        isProspect: isMinors || age <= 23,
+        isMinors,
+        gp, fpAvg, fpTotal: fp,
+        status: "FA",
+      };
+
+      if (type === "hitter") {
+        players.push({ ...base,
+          hr:  st.homeRuns       || 0,
+          sb:  st.stolenBases    || 0,
+          rbi: st.rbi            || 0,
+          r:   st.runs           || 0,
+          bb:  st.baseOnBalls    || 0,
+          so:  st.strikeOuts     || 0,
+          h:   st.hits           || 0,
+          ab:  st.atBats         || 0,
+        });
+      } else {
+        const ip = parseIP(st.inningsPitched);
+        players.push({ ...base,
+          ip,
+          era: parseFloat(st.era) || 0,
+          k:   st.strikeOuts      || 0,
+          w:   st.wins            || 0,
+          sv:  st.saves           || 0,
+          hld: st.holds           || 0,
+          qs:  st.qualityStarts   || 0,
+        });
+      }
+    }
+  }
+
+  processSplits(mlbH, "hitter",  false);
+  processSplits(mlbP, "pitcher", false);
+  processSplits(aaaH, "hitter",  true);
+  processSplits(aaaP, "pitcher", true);
+
+  // Batch-fetch ages for players missing currentAge from the stats endpoint
+  const missingAge = [...new Set(players.filter(p => !p.age).map(p => p.mlbId))];
+  if (missingAge.length > 0) {
+    const CHUNK = 250;
+    const ageMap = {};
+    for (let i = 0; i < missingAge.length; i += CHUNK) {
+      try {
+        const ids = missingAge.slice(i, i + CHUNK).join(",");
+        const resp = await fetch(
+          `${MLB_API}/people?personIds=${ids}&fields=people,id,currentAge,birthDate`
+        ).then(r => r.json());
+        for (const person of (resp.people || [])) {
+          if (person.currentAge) {
+            ageMap[person.id] = person.currentAge;
+          } else if (person.birthDate) {
+            const b = new Date(person.birthDate), now = new Date();
+            let a = now.getFullYear() - b.getFullYear();
+            if (now.getMonth() < b.getMonth() || (now.getMonth() === b.getMonth() && now.getDate() < b.getDate())) a--;
+            ageMap[person.id] = a;
+          }
+        }
+      } catch(_) {}
+    }
+    for (const p of players) {
+      if (!p.age && ageMap[p.mlbId]) {
+        p.age = ageMap[p.mlbId];
+        p.isProspect = p.isMinors || p.age <= 23;
+      }
+    }
+  }
+
+  return players.sort((a, b) => b.fpAvg - a.fpAvg);
+}
+
+/* ── PLAYER SEARCH DROPDOWN ────────────────────────────────────*/
+function PlayerSearch({ dir, ownedNames, onSelect, onEvaluate }) {
+  const [query,  setQuery]  = useState("");
+  const [open,   setOpen]   = useState(false);
+
+  const results = useMemo(() => {
+    if (!dir?.length || query.length < 2) return [];
+    const q = query.toLowerCase();
+    return dir
+      .filter(p => p.name.toLowerCase().includes(q) && !(ownedNames||new Set()).has(p.name))
+      .slice(0, 18);
+  }, [query, dir, ownedNames]);
+
+  const handleEvaluate = (p) => {
+    onEvaluate({
+      id: `fa-${Date.now()}-${p.mlbId}`,
+      name: p.name, team: p.team, pos: p.pos,
+      eligible: p.pos, type: p.type,
+      age: p.age, isProspect: !!p.isProspect,
+      status: "FA", gp: p.gp,
+      fpAvg: p.fpAvg, fpTotal: p.fpTotal,
+      hr: p.hr||0, sb: p.sb||0, rbi: p.rbi||0,
+      r: p.r||0, bb: p.bb||0, so: p.so||0, h: p.h||0, ab: p.ab||0,
+      ip: p.ip||0, era: p.era||0, k: p.k||0, sv: p.sv||0, hld: p.hld||0, qs: p.qs||0,
+    });
+    setQuery(""); setOpen(false);
+  };
+
+  return (
+    <div className="relative">
+      <input
+        className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-400"
+        placeholder={dir?.length ? "Search player name — click ＋ Evaluate to analyze instantly…" : "Load player directory first ↑"}
+        value={query}
+        onChange={e => { setQuery(e.target.value); setOpen(true); }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setTimeout(() => setOpen(false), 200)}
+      />
+      {open && results.length > 0 && (
+        <div className="absolute z-50 left-0 right-0 bg-white border border-gray-200 rounded-xl shadow-xl mt-1 max-h-80 overflow-y-auto">
+          {results.map(p => (
+            <div key={p.id} className="flex items-center border-b border-gray-100 last:border-0 hover:bg-gray-50 transition-colors">
+              {/* Player info — click to fill form */}
+              <button
+                type="button"
+                onMouseDown={() => { onSelect(p); setQuery(p.name); setOpen(false); }}
+                className="flex-1 text-left px-4 py-2.5 flex items-center gap-3 min-w-0">
+                <div className="min-w-0 flex-1">
+                  <span className="font-semibold text-sm text-gray-900">{p.name}</span>
+                  <span className="text-xs text-gray-400 ml-2">{p.team} · {p.pos}</span>
+                  {p.isMinors && <span className="ml-1.5 text-xs bg-purple-100 text-purple-700 font-semibold px-1.5 py-0.5 rounded-full">AAA</span>}
+                  {!p.isMinors && p.isProspect && <span className="ml-1.5 text-xs bg-emerald-100 text-emerald-700 font-semibold px-1.5 py-0.5 rounded-full">Prospect</span>}
+                  <div className="text-xs text-gray-400 mt-0.5">
+                    {p.type==="hitter"
+                      ? `${p.fpAvg.toFixed(2)} pts/gm · ${p.gp} GP · ${p.hr} HR · ${p.sb} SB · ${p.rbi} RBI`
+                      : `${p.fpAvg.toFixed(2)} pts/gm · ${p.gp} GP · ${p.ip?.toFixed ? p.ip.toFixed(1) : p.ip} IP · ${p.k} K · ${p.sv} SV`}
+                  </div>
+                </div>
+              </button>
+              {/* One-click evaluate button */}
+              <button
+                type="button"
+                onMouseDown={() => handleEvaluate(p)}
+                className="shrink-0 mr-3 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap">
+                + Evaluate
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ── FA ENTRY FORM ─────────────────────────────────────────────*/
+function FaForm({ onAdd, mlbDir, ownedNames }) {
+  const [f, setF] = useState({...EMPTY_FA});
+  const [err, setErr] = useState(null);
+  const set = (k,v) => setF(p=>({...p,[k]:v}));
+  const isPitcher = ["SP","RP"].includes(f.pos);
+
+  // Auto-fill form from a selected MLB directory player
+  const selectPlayer = (p) => {
+    setF({
+      name: p.name, team: p.team !== "?" ? p.team : "", pos: p.pos,
+      age:  p.age > 0 ? String(p.age) : "",
+      gp:   String(p.gp  || ""),
+      fpAvg:String(p.fpAvg != null ? p.fpAvg.toFixed(2) : ""),
+      isProspect: !!p.isProspect,
+      hr:  String(p.hr  || 0),
+      sb:  String(p.sb  || 0),
+      rbi: String(p.rbi || 0),
+      ip:  String(p.ip  ? p.ip.toFixed(1) : ""),
+      era: String(p.era || ""),
+      k:   String(p.k   || 0),
+      sv:  String(p.sv  || 0),
+      qs:  String(p.qs  || 0),
+    });
+    setErr(null);
+  };
+
+  const handleAdd = () => {
+    if (!f.name.trim()) { setErr("Player name is required."); return; }
+    if (!f.age || isNaN(parseInt(f.age))) { setErr("Age couldn't be loaded automatically for this player — please type it in the Age field above."); return; }
+    const fp = parseFloat(f.fpAvg)||0;
+    onAdd({
+      id: `fa-${Date.now()}`, name:f.name.trim(), team:f.team.trim()||"?", pos:f.pos,
+      eligible: f.pos, type: isPitcher?"pitcher":"hitter",
+      age: parseInt(f.age)||25, isProspect:f.isProspect, status:"FA",
+      fpAvg:fp, fpTotal:fp*(parseInt(f.gp)||0), gp:parseInt(f.gp)||0,
+      hr:parseInt(f.hr)||0, sb:parseInt(f.sb)||0, rbi:parseInt(f.rbi)||0,
+      ip:parseFloat(f.ip)||0, era:parseFloat(f.era)||0,
+      k:parseInt(f.k)||0, sv:parseInt(f.sv)||0, qs:parseInt(f.qs)||0,
+    });
+    setF({...EMPTY_FA}); setErr(null);
+  };
+
+  return (
+    <div className="bg-white rounded-xl shadow p-5">
+      <h3 className="font-bold text-gray-800 mb-1">Add Free Agent / Waiver Target</h3>
+      <p className="text-xs text-gray-400 mb-4">
+        {mlbDir?.length
+          ? `🟢 Live directory loaded — ${mlbDir.length.toLocaleString()} players (MLB + AAA). Search below or fill manually.`
+          : "Load the live directory above to auto-fill stats, or enter manually."}
+      </p>
+
+      {err && <div className="bg-red-50 border border-red-200 text-red-700 text-xs rounded-lg px-3 py-2 mb-3">{err}</div>}
+
+      {/* Player search (replaces plain name input when directory loaded) */}
+      <div className="mb-3">
+        <label className="text-xs text-gray-500 block mb-1">Player Name *</label>
+        {mlbDir?.length
+          ? <PlayerSearch dir={mlbDir} ownedNames={ownedNames} onSelect={selectPlayer} onEvaluate={onAdd}/>
+          : <input className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-400" placeholder="e.g. Jackson Holliday" value={f.name} onChange={e=>set("name",e.target.value)}/>
+        }
+        {/* After auto-fill, show the selected name as read-only badge */}
+        {mlbDir?.length && f.name && (
+          <div className="flex items-center gap-2 mt-1.5">
+            <span className="text-xs text-gray-700 font-medium bg-gray-100 px-2 py-1 rounded-lg">{f.name} {f.team && `· ${f.team}`} {f.pos && `· ${f.pos}`}</span>
+            <button onClick={()=>setF({...EMPTY_FA})} className="text-xs text-gray-400 hover:text-red-500">✕ clear</button>
+          </div>
+        )}
+      </div>
+
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
+        {!mlbDir?.length && (
+          <>
+            <div><label className="text-xs text-gray-500 block mb-1">Team</label>
+              <input className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-400" placeholder="BAL" value={f.team} onChange={e=>set("team",e.target.value)}/></div>
+            <div><label className="text-xs text-gray-500 block mb-1">Position</label>
+              <select className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-400" value={f.pos} onChange={e=>set("pos",e.target.value)}>
+                {["C","1B","2B","3B","SS","OF","SP","RP"].map(p=><option key={p}>{p}</option>)}
+              </select></div>
+          </>
+        )}
+        {mlbDir?.length && (
+          <div><label className="text-xs text-gray-500 block mb-1">Position (override)</label>
+            <select className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-400" value={f.pos} onChange={e=>set("pos",e.target.value)}>
+              {["C","1B","2B","3B","SS","OF","SP","RP"].map(p=><option key={p}>{p}</option>)}
+            </select></div>
+        )}
+        <div><label className={`text-xs block mb-1 ${mlbDir?.length && !f.age && f.name ? "text-orange-500 font-semibold" : "text-gray-500"}`}>
+          Age {mlbDir?.length && f.name && !f.age ? "⚠ enter manually" : mlbDir?.length ? "(auto-filled)" : ""}
+        </label>
+          <input type="number" min="18" max="45" className={`w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-400 ${mlbDir?.length && !f.age && f.name ? "border-orange-300 bg-orange-50" : ""}`} placeholder="Enter age" value={f.age} onChange={e=>set("age",e.target.value)}/></div>
+        <div><label className="text-xs text-gray-500 block mb-1">GP {mlbDir?.length && "(auto-filled)"}</label>
+          <input type="number" min="0" className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-400" placeholder="10" value={f.gp} onChange={e=>set("gp",e.target.value)}/></div>
+        <div><label className="text-xs text-gray-500 block mb-1">Avg Pts/gm {mlbDir?.length && "(auto-filled)"}</label>
+          <input type="number" step="0.01" className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-400" placeholder="3.50" value={f.fpAvg} onChange={e=>set("fpAvg",e.target.value)}/></div>
+        <div className="flex items-end pb-1">
+          <label className="flex items-center gap-2 cursor-pointer select-none">
+            <input type="checkbox" checked={f.isProspect} onChange={e=>set("isProspect",e.target.checked)} className="w-4 h-4 accent-blue-600"/>
+            <span className="text-xs text-gray-600">Prospect / Minor Leaguer</span>
+          </label>
+        </div>
+      </div>
+
+      {/* Hitter stats */}
+      {!isPitcher && (
+        <div className="grid grid-cols-3 md:grid-cols-6 gap-3 mb-4">
+          {[["hr","HR"],["sb","SB"],["rbi","RBI"]].map(([k,l])=>(
+            <div key={k}><label className="text-xs text-gray-500 block mb-1">{l}{mlbDir?.length?" (auto)":""}</label>
+              <input type="number" min="0" className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-400" placeholder="0" value={f[k]} onChange={e=>set(k,e.target.value)}/></div>
+          ))}
+        </div>
+      )}
+
+      {/* Pitcher stats */}
+      {isPitcher && (
+        <div className="grid grid-cols-3 md:grid-cols-5 gap-3 mb-4">
+          {[["ip","IP"],["era","ERA"],["k","K"],["sv","SV"],["qs","QS"]].map(([k,l])=>(
+            <div key={k}><label className="text-xs text-gray-500 block mb-1">{l}{mlbDir?.length?" (auto)":""}</label>
+              <input type="number" min="0" step={k==="era"||k==="ip"?"0.1":"1"} className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-400" placeholder="0" value={f[k]} onChange={e=>set(k,e.target.value)}/></div>
+          ))}
+        </div>
+      )}
+
+      <button onClick={handleAdd} className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold px-6 py-2 rounded-lg transition-colors">
+        + Evaluate Player
+      </button>
+    </div>
+  );
+}
+
+function FaCard({ fa, roster, posNeeds, catNeeds, remainingFaab, onRemove }) {
+  const [open, setOpen] = useState(true);
+  const active = roster ? roster.all.filter(p=>p.status==="Act") : [];
+  const { score: fitScore, breakdown } = faFitScore(fa, posNeeds, catNeeds, active);
+  const ds      = dynastyScore(fa);
+  const verdict = faVerdict(fitScore, ds);
+  const bid     = suggestedBid(fitScore, ds, remainingFaab);
+  const tier    = ageTier(fa.age||25);
+
+  const scoreBar = (score) => {
+    const color = score>=70?"bg-green-500":score>=45?"bg-blue-500":score>=25?"bg-yellow-400":"bg-gray-300";
+    return <div className="flex items-center gap-2"><div className="flex-1 h-2 bg-gray-200 rounded-full overflow-hidden"><div className={`h-full rounded-full ${color}`} style={{width:`${score}%`}}/></div><span className="text-xs font-bold w-6">{score}</span></div>;
+  };
+
+  return (
+    <div className="bg-white rounded-xl shadow border border-gray-100 overflow-hidden">
+      <div className="flex items-center justify-between px-5 py-4 cursor-pointer" onClick={()=>setOpen(o=>!o)}>
+        <div className="flex items-center gap-3 flex-wrap">
+          <span className={`font-bold px-1.5 py-0.5 rounded-full text-xs ${posColor(fa.pos)}`}>{fa.pos}</span>
+          <div>
+            <span className="font-bold text-gray-900">{fa.name}</span>
+            <span className="text-gray-400 text-xs ml-2">{fa.team} · Age {fa.age}</span>
+            {fa.isProspect && <span className="ml-2 text-xs bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded-full font-semibold">Prospect</span>}
+          </div>
+          <span className={`text-xs font-bold px-3 py-1 rounded-full ${verdict.color}`}>{verdict.emoji} {verdict.label}</span>
+        </div>
+        <div className="flex items-center gap-3">
+          <button onClick={e=>{e.stopPropagation();onRemove(fa.id);}} className="text-gray-300 hover:text-red-400 text-sm px-2">✕</button>
+          <span className="text-gray-400 text-xs">{open?"▲":"▼"}</span>
+        </div>
+      </div>
+
+      {open && (
+        <div className="px-5 pb-5 border-t border-gray-50">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-5 mt-4">
+
+            {/* Scores */}
+            <div className="space-y-3">
+              {!roster && <div className="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-1.5">⚠ Import your roster CSV for a personalized fit score</div>}
+              <div>
+                <div className="flex justify-between text-xs mb-1"><span className="text-gray-500 font-medium">Team Fit Score</span><span className="font-bold text-gray-700">{fitScore}/100</span></div>
+                {scoreBar(fitScore)}
+              </div>
+              <div>
+                <div className="flex justify-between text-xs mb-1"><span className="text-gray-500 font-medium">Dynasty Value</span><span className="font-bold text-gray-700">{ds}/100</span></div>
+                {scoreBar(ds)}
+              </div>
+              <div className="bg-slate-50 rounded-lg p-3 text-center mt-2">
+                <div className="text-xs text-gray-500 mb-0.5">Suggested FAAB Bid</div>
+                <div className="text-2xl font-black text-slate-800">${bid.toLocaleString()}</div>
+                <div className="text-xs text-gray-400">of ${remainingFaab.toLocaleString()} remaining</div>
+              </div>
+            </div>
+
+            {/* Fit breakdown */}
+            <div>
+              <div className="text-xs font-bold text-gray-600 uppercase tracking-wide mb-2">Fit Analysis</div>
+              <div className="space-y-1.5">
+                {breakdown.map((b,i)=>(
+                  <div key={i} className="flex items-start gap-2 text-xs">
+                    <span className={b.positive?"text-green-500":"text-red-400"}>{b.positive?"✓":"✗"}</span>
+                    <span className="text-gray-600 flex-1">{b.label}</span>
+                    {b.pts>0&&<span className="text-green-600 font-bold">+{b.pts}</span>}
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Player stats */}
+            <div>
+              <div className="text-xs font-bold text-gray-600 uppercase tracking-wide mb-2">Player Stats</div>
+              <div className="space-y-1 text-xs text-gray-600">
+                <div className="flex items-center gap-1.5"><Stars n={tier.stars}/><span className={tier.color}>{tier.label}</span></div>
+                <div>Avg/gm: <strong className={`${fa.fpAvg>3?"text-green-600":fa.fpAvg>1.5?"text-yellow-600":"text-red-500"}`}>{fa.fpAvg.toFixed(1)}</strong></div>
+                <div>Games played: {fa.gp}</div>
+                {fa.type==="hitter"&&<>
+                  {fa.hr>0&&<div>HR: {fa.hr}</div>}
+                  {fa.sb>0&&<div>SB: {fa.sb}</div>}
+                  {fa.rbi>0&&<div>RBI: {fa.rbi}</div>}
+                </>}
+                {fa.type==="pitcher"&&<>
+                  {fa.ip>0&&<div>IP: {fa.ip} · ERA: {fa.era.toFixed(2)}</div>}
+                  <div>K: {fa.k} {fa.sv>0?`· SV: ${fa.sv}`:""} {fa.qs>0?`· QS: ${fa.qs}`:""}</div>
+                </>}
+                {fa.isProspect&&<div className="text-blue-600 font-semibold">📦 Dynasty stash — long-term value</div>}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ── FA RESULTS (scored + filtered list) ───────────────────────*/
+/* ── FA TARGET PICKER (shown after CSV import) ─────────────────
+   Shows curated picks from the import pool with selectable cards.
+   User clicks "+ Evaluate" to add players to the full analysis.
+   ─────────────────────────────────────────────────────────────*/
+function ImportTargetPicker({ pool, roster, positionNeeds, categoryNeeds, remaining, addedIds, onAdd, onClear }) {
+  const [showBrowse, setShowBrowse] = useState(false);
+  const [typeFilter, setTypeFilter] = useState("all");
+  const [posFilter,  setPosFilter]  = useState("all");
+  const [search,     setSearch]     = useState("");
+
+  // Dynasty longevity label for a player
+  function dynastyWindow(age) {
+    if (!age || age === 0) return "Age unknown";
+    if (age <= 22) return "10+ yr dynasty window";
+    if (age <= 25) return "7–8 yr dynasty window";
+    if (age <= 27) return "4–5 yr peak window";
+    if (age <= 30) return "2–3 yr contributor";
+    return "Win-now only";
+  }
+
+  // Smart groupings from the pool
+  const winNow = pool
+    .filter(p => !p.isMinors && p._fitScore >= 20 && (p.gp > 0 || p.fpAvg > 0))
+    .slice(0, 4);
+
+  const dynastyTargets = pool
+    .filter(p => p.isMinors || p.isProspect || (p.age > 0 && p.age <= 24))
+    .sort((a, b) => b._dynastyScore - a._dynastyScore)
+    .slice(0, 4);
+
+  const needFills = positionNeeds
+    .filter(n => n.severity === "critical")
+    .map(need => ({
+      need,
+      player: pool
+        .filter(p => p.type === need.type && eligibleFor(p, need.pos) && !p.isMinors)
+        .sort((a, b) => b._fitScore - a._fitScore)[0],
+    }))
+    .filter(x => x.player)
+    .slice(0, 3);
+
+  // Browse-all filtered list
+  const browseList = useMemo(() => {
+    let list = pool;
+    if (typeFilter === "hitters")  list = list.filter(p => p.type === "hitter");
+    if (typeFilter === "pitchers") list = list.filter(p => p.type === "pitcher");
+    if (posFilter !== "all")       list = list.filter(p => eligibleFor(p, posFilter));
+    if (search.length >= 2)        list = list.filter(p => p.name.toLowerCase().includes(search.toLowerCase()));
+    return list.slice(0, 35);
+  }, [pool, typeFilter, posFilter, search]);
+
+  // Compact selectable player card
+  function PickCard({ fa, reason }) {
+    const isAdded  = addedIds.has(fa.id);
+    const verdict  = faVerdict(fa._fitScore, fa._dynastyScore);
+    const tier     = ageTier(fa.age || 25);
+    const statsLine = fa.type === "hitter"
+      ? [fa.fpAvg.toFixed(1)+" pts/gm", fa.gp+" GP",
+         fa.hr  ? fa.hr+" HR"  : "",
+         fa.sb  ? fa.sb+" SB"  : "",
+         fa.rbi ? fa.rbi+" RBI": ""].filter(Boolean).join(" · ")
+      : [fa.fpAvg.toFixed(1)+" pts/gm", fa.gp+" GP",
+         fa.ip  ? (typeof fa.ip === "number" ? fa.ip.toFixed(1) : fa.ip)+" IP" : "",
+         fa.k   ? fa.k+" K"   : "",
+         fa.sv  ? fa.sv+" SV" : "",
+         fa.qs  ? fa.qs+" QS" : ""].filter(Boolean).join(" · ");
+
+    return (
+      <div className={`rounded-xl border p-3.5 transition-all ${isAdded ? "border-green-300 bg-green-50" : "border-gray-100 bg-white shadow-sm hover:shadow-md"}`}>
+        {/* Name row */}
+        <div className="flex items-start justify-between gap-2 mb-2">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-1.5 flex-wrap mb-0.5">
+              <span className={`text-xs font-bold px-1.5 py-0.5 rounded-full shrink-0 ${posColor(fa.pos)}`}>{fa.pos}</span>
+              <span className="font-bold text-gray-900 text-sm">{fa.name}</span>
+              <span className="text-gray-400 text-xs">{fa.team}</span>
+              {fa.isMinors && <span className="text-xs bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded-full font-semibold">AAA</span>}
+              {!fa.isMinors && fa.isProspect && <span className="text-xs bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded-full font-semibold">Prospect</span>}
+            </div>
+            <div className="flex items-center gap-2 text-xs flex-wrap">
+              <span className="text-gray-400">Age {fa.age || "?"}</span>
+              <span className={`font-semibold ${tier.color}`}>{tier.label}</span>
+              <span className="text-gray-300">·</span>
+              <span className="text-gray-400 italic">{dynastyWindow(fa.age)}</span>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => !isAdded && onAdd(fa)}
+            className={`shrink-0 text-xs font-bold px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap ${
+              isAdded
+                ? "bg-green-100 text-green-700 cursor-default"
+                : "bg-blue-600 hover:bg-blue-700 text-white"
+            }`}>
+            {isAdded ? "✓ Evaluating" : "+ Evaluate"}
+          </button>
+        </div>
+        {/* Scores row */}
+        <div className="flex items-center gap-3 mb-1.5 flex-wrap">
+          <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${verdict.color}`}>{verdict.emoji} {verdict.label}</span>
+          <div className="flex items-center gap-1.5">
+            <span className="text-xs text-gray-400">Fit</span>
+            <div className="w-14 h-1.5 bg-gray-200 rounded-full overflow-hidden">
+              <div className={`h-full rounded-full ${fa._fitScore>=70?"bg-green-500":fa._fitScore>=45?"bg-blue-500":fa._fitScore>=25?"bg-yellow-400":"bg-gray-300"}`} style={{width:`${fa._fitScore}%`}}/>
+            </div>
+            <span className="text-xs font-bold text-gray-700">{fa._fitScore}</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <span className="text-xs text-gray-400">Dynasty</span>
+            <div className="w-14 h-1.5 bg-gray-200 rounded-full overflow-hidden">
+              <div className={`h-full rounded-full ${fa._dynastyScore>=70?"bg-emerald-500":fa._dynastyScore>=45?"bg-indigo-400":"bg-gray-400"}`} style={{width:`${fa._dynastyScore}%`}}/>
+            </div>
+            <span className="text-xs font-bold text-gray-700">{fa._dynastyScore}</span>
+          </div>
+          <Stars n={tier.stars}/>
+        </div>
+        {/* Stats + reason */}
+        <div className="text-xs text-gray-400">{statsLine}</div>
+        {reason && <div className="text-xs text-blue-600 font-medium mt-1.5 italic">{reason}</div>}
+      </div>
+    );
+  }
+
+  const strongAdds = pool.filter(p => p._verdict === "Strong Add").length;
+  const consider   = pool.filter(p => p._verdict === "Consider").length;
+  const stash      = pool.filter(p => p._verdict === "Dynasty Stash").length;
+  const passCount  = pool.filter(p => p._verdict === "Pass").length;
+
+  return (
+    <div className="rounded-xl overflow-hidden shadow-lg border border-slate-200">
+
+      {/* ── Header banner ── */}
+      <div className="bg-gradient-to-r from-slate-900 to-blue-900 text-white px-5 py-5">
+        <div className="flex items-start justify-between gap-3 mb-4">
+          <div>
+            <h3 className="font-black text-base">🎯 {pool.length} Free Agents Analyzed</h3>
+            <p className="text-slate-300 text-xs mt-0.5">
+              Ranked by fit with <strong className="text-white">your current roster</strong>, league rules, and dynasty longevity.
+              Click <span className="bg-blue-600 text-white px-1.5 py-0.5 rounded text-xs font-semibold">+ Evaluate</span> on any player for a full breakdown.
+            </p>
+            {!roster && (
+              <p className="text-amber-300 text-xs mt-1.5">⚠ Import your team roster CSV for personalized fit scores and positional need fills.</p>
+            )}
+          </div>
+          <button onClick={onClear} className="text-xs text-slate-400 hover:text-red-300 transition-colors shrink-0 mt-1">✕ Clear</button>
+        </div>
+        <div className="grid grid-cols-4 gap-3 text-center text-xs">
+          {[
+            { label:"Strong Adds",   count:strongAdds, color:"text-green-400",  bg:"bg-green-900/40"  },
+            { label:"Consider",      count:consider,   color:"text-blue-300",   bg:"bg-blue-900/40"   },
+            { label:"Dynasty Stash", count:stash,      color:"text-indigo-300", bg:"bg-indigo-900/40" },
+            { label:"Pass",          count:passCount,  color:"text-slate-500",  bg:"bg-slate-800/40"  },
+          ].map(({ label, count, color, bg }) => (
+            <div key={label} className={`${bg} rounded-xl py-2.5 border border-white/5`}>
+              <div className={`text-2xl font-black ${color}`}>{count}</div>
+              <div className="text-slate-400 text-xs mt-0.5">{label}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* ── Smart pick columns ── */}
+      <div className="p-5 bg-slate-50">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-5 mb-5">
+
+          {/* WIN NOW */}
+          <div>
+            <div className="flex items-center gap-2 mb-3">
+              <div className="w-8 h-8 rounded-xl bg-green-100 flex items-center justify-center text-base shrink-0">🏆</div>
+              <div>
+                <div className="font-black text-sm text-gray-800">Win Now</div>
+                <div className="text-xs text-gray-400">Best immediate adds for this season</div>
+              </div>
+            </div>
+            {winNow.length > 0 ? (
+              <div className="space-y-2.5">
+                {winNow.map((fa, i) => (
+                  <PickCard key={fa.id} fa={fa} reason={
+                    i===0 ? "Best overall fit for your current roster" :
+                    i===1 ? "Strong secondary option" :
+                    i===2 ? "Solid depth pickup" :
+                    "Worth considering"
+                  }/>
+                ))}
+              </div>
+            ) : (
+              <div className="text-xs text-gray-400 text-center py-6 border-2 border-dashed border-gray-200 rounded-xl">No active win-now options found.</div>
+            )}
+          </div>
+
+          {/* DYNASTY STASH */}
+          <div>
+            <div className="flex items-center gap-2 mb-3">
+              <div className="w-8 h-8 rounded-xl bg-indigo-100 flex items-center justify-center text-base shrink-0">📦</div>
+              <div>
+                <div className="font-black text-sm text-gray-800">Dynasty Stash</div>
+                <div className="text-xs text-gray-400">Prospects &amp; long-term assets</div>
+              </div>
+            </div>
+            {dynastyTargets.length > 0 ? (
+              <div className="space-y-2.5">
+                {dynastyTargets.map((fa) => {
+                  const tier = ageTier(fa.age || 25);
+                  return (
+                    <PickCard key={fa.id} fa={fa} reason={
+                      fa.isMinors          ? `${tier.label} — stash in minors while available` :
+                      (fa.age||99) <= 22   ? "Elite prospect window — grab immediately" :
+                      (fa.age||99) <= 25   ? "Prime upside years ahead — dynasty core" :
+                      "Young asset, strong dynasty upside"
+                    }/>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="text-xs text-gray-400 text-center py-6 border-2 border-dashed border-gray-200 rounded-xl">No dynasty prospects in this pool.</div>
+            )}
+          </div>
+
+          {/* FILL YOUR HOLES */}
+          <div>
+            <div className="flex items-center gap-2 mb-3">
+              <div className="w-8 h-8 rounded-xl bg-red-100 flex items-center justify-center text-base shrink-0">🚨</div>
+              <div>
+                <div className="font-black text-sm text-gray-800">Fill Your Holes</div>
+                <div className="text-xs text-gray-400">Addresses your critical needs</div>
+              </div>
+            </div>
+            {needFills.length > 0 ? (
+              <div className="space-y-2.5">
+                {needFills.map(({ need, player }) => (
+                  <PickCard key={player.id} fa={player}
+                    reason={`Best available ${need.label} (${need.note})`}/>
+                ))}
+              </div>
+            ) : (
+              <div className="text-center py-6 border-2 border-dashed border-gray-200 rounded-xl">
+                {roster
+                  ? <p className="text-xs text-green-600 font-semibold">✅ No critical positional needs detected.</p>
+                  : <p className="text-xs text-gray-400">Import your roster CSV<br/>to see need-specific picks.</p>
+                }
+              </div>
+            )}
+          </div>
+
+        </div>
+
+        {/* ── Browse All ── */}
+        <div className="border-t border-gray-200 pt-4">
+          <button
+            type="button"
+            onClick={() => setShowBrowse(v => !v)}
+            className="flex items-center gap-2 text-sm font-semibold text-gray-600 hover:text-blue-600 transition-colors w-full mb-1">
+            <span>{showBrowse ? "▲" : "▼"}</span>
+            Browse All {pool.length} Free Agents
+          </button>
+          <p className="text-xs text-gray-400 mb-3">Search or filter the full list — every player is already ranked for your team.</p>
+
+          {showBrowse && (
+            <div>
+              <div className="flex flex-wrap gap-2.5 mb-3">
+                <input
+                  className="flex-1 min-w-40 border rounded-lg px-3 py-1.5 text-xs focus:outline-none focus:border-blue-400"
+                  placeholder="Search by name…"
+                  value={search}
+                  onChange={e => setSearch(e.target.value)}/>
+                <div className="flex gap-2">
+                  {[["all","All"],["hitters","Hitters"],["pitchers","Pitchers"]].map(([k,l])=>(
+                    <button key={k} type="button" onClick={() => setTypeFilter(k)}
+                      className={`px-3 py-1.5 rounded-full text-xs font-medium transition-colors ${typeFilter===k?"bg-blue-600 text-white":"bg-white border border-gray-200 text-gray-600 hover:bg-gray-50"}`}>
+                      {l}
+                    </button>
+                  ))}
+                </div>
+                <select value={posFilter} onChange={e => setPosFilter(e.target.value)}
+                  className="border rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:border-blue-400 bg-white">
+                  {["all","C","1B","2B","3B","SS","OF","SP","RP"].map(p=>(
+                    <option key={p} value={p}>{p==="all"?"All Positions":p}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="space-y-2 max-h-[32rem] overflow-y-auto pr-1">
+                {browseList.map(fa => <PickCard key={fa.id} fa={fa}/>)}
+                {browseList.length === 0 && <p className="text-xs text-gray-400 text-center py-6">No players match.</p>}
+                {browseList.length === 35 && (
+                  <p className="text-xs text-gray-400 text-center py-2">Showing top 35 — use search to narrow down.</p>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── FA RESULTS — full evaluation list ─────────────────────────
+   Shows detailed FaCard analysis for every player the user has
+   clicked "+ Evaluate" on (from picker or from manual entry).
+   ─────────────────────────────────────────────────────────────*/
+// (SmartTargetCard replaced by PickCard inside ImportTargetPicker)
+
+function FaResults({ faPlayers, roster, positionNeeds, categoryNeeds, remaining, faFilter, posFilter, setFaFilter, setPosFilter, removeFa }) {
+  const active = roster ? roster.all.filter(p => p.status === "Act") : [];
+
+  // Score every player (reuse pre-computed values from bulk import if present)
+  const scored = useMemo(() => {
+    return faPlayers.map(fa => {
+      const fitScore = fa._fitScore    != null ? fa._fitScore    : faFitScore(fa, positionNeeds, categoryNeeds, active).score;
+      const ds       = fa._dynastyScore != null ? fa._dynastyScore : dynastyScore(fa);
+      const verdict  = faVerdict(fitScore, ds);
+      const combined = fitScore * 0.65 + ds * 0.35;
+      return { ...fa, _fitScore: fitScore, _dynastyScore: ds, _verdict: verdict.label, _combined: combined };
+    }).sort((a, b) => b._combined - a._combined);
+  }, [faPlayers, positionNeeds, categoryNeeds, roster]);
+
+  const bulkCount  = faPlayers.filter(p => p.fromImport).length;
+  const strongAdds = scored.filter(p => p._verdict === "Strong Add").length;
+  const consider   = scored.filter(p => p._verdict === "Consider").length;
+  const stash      = scored.filter(p => p._verdict === "Dynasty Stash").length;
+  const pass       = scored.filter(p => p._verdict === "Pass").length;
+
+  // ── Smart target groups ───────────────────────────────────────
+  // Win Now: active (non-minors) players best suited for immediate impact
+  const winNow = scored
+    .filter(p => !p.isMinors && p._fitScore >= 25 && (p.gp > 0 || p.fpAvg > 0))
+    .slice(0, 4);
+
+  // Dynasty Stash: prospects / minors / age ≤ 24 sorted by dynasty score
+  const dynastyTargets = scored
+    .filter(p => p.isMinors || p.isProspect || (p.age > 0 && p.age <= 24))
+    .sort((a, b) => b._dynastyScore - a._dynastyScore)
+    .slice(0, 4);
+
+  // Fill Your Holes: best available player for each critical positional need
+  const needFills = positionNeeds
+    .filter(n => n.severity === "critical")
+    .map(need => ({
+      need,
+      player: scored
+        .filter(p => p.type === need.type && eligibleFor(p, need.pos) && !p.isMinors)
+        .sort((a, b) => b._fitScore - a._fitScore)[0],
+    }))
+    .filter(x => x.player)
+    .slice(0, 4);
+
+  const hasSmartTargets = bulkCount > 0 && (winNow.length > 0 || dynastyTargets.length > 0 || needFills.length > 0);
+
+  // Filter tabs
+  const displayed = useMemo(() => {
+    let list = scored;
+    if (faFilter === "targets")  list = list.filter(p => p._verdict !== "Pass");
+    if (faFilter === "hitters")  list = list.filter(p => p.type === "hitter");
+    if (faFilter === "pitchers") list = list.filter(p => p.type === "pitcher");
+    if (posFilter !== "all")     list = list.filter(p => eligibleFor(p, posFilter));
+    return list;
+  }, [scored, faFilter, posFilter]);
+
+  if (faPlayers.length === 0) return null;
+
+  const POS_OPTIONS = ["all","C","1B","2B","3B","SS","OF","SP","RP"];
+
+  return (
+    <div>
+
+      {/* ── Bulk import summary banner ── */}
+      {bulkCount > 0 && (
+        <div className="bg-slate-800 rounded-xl p-5 text-white mb-4">
+          <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
+            <h3 className="font-bold text-sm">📊 FA Import — {bulkCount} players analyzed</h3>
+            <button onClick={() => setFaPlayers(prev => prev.filter(p => !p.fromImport))}
+              className="text-xs text-slate-400 hover:text-red-300 transition-colors">✕ Clear import</button>
+          </div>
+          <div className="grid grid-cols-4 gap-3 text-center text-xs">
+            {[
+              { label:"Strong Adds",   count:strongAdds, color:"text-green-400"  },
+              { label:"Consider",      count:consider,   color:"text-blue-400"   },
+              { label:"Dynasty Stash", count:stash,      color:"text-indigo-400" },
+              { label:"Pass",          count:pass,       color:"text-slate-400"  },
+            ].map(({ label, count, color }) => (
+              <div key={label} className="bg-slate-700 rounded-lg py-2.5">
+                <div className={`text-2xl font-black ${color}`}>{count}</div>
+                <div className="text-slate-400 mt-0.5">{label}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ── Smart Targets ── */}
+      {hasSmartTargets && (
+        <div className="mb-5">
+          <div className="flex items-center gap-2 mb-3">
+            <h3 className="font-bold text-gray-800 text-sm">🎯 Suggested Targets for Your Team</h3>
+            {!roster && <span className="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-2 py-0.5">⚠ Import your roster CSV for personalized picks</span>}
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
+
+            {/* Win Now */}
+            {winNow.length > 0 && (
+              <div className="bg-gradient-to-b from-green-50 to-white rounded-xl border border-green-100 shadow-sm p-4">
+                <div className="flex items-center gap-2 mb-3 pb-2 border-b border-green-100">
+                  <span className="text-lg">🏆</span>
+                  <div>
+                    <div className="font-black text-sm text-gray-800">Win Now</div>
+                    <div className="text-xs text-gray-400">Best immediate pickups</div>
+                  </div>
+                </div>
+                <div className="space-y-3">
+                  {winNow.map((fa, i) => (
+                    <SmartTargetCard key={fa.id} fa={fa} rank={i+1}
+                      reason={
+                        i===0 ? "Top overall fit for your roster" :
+                        i===1 ? "Strong secondary option" :
+                        i===2 ? "Solid depth add" :
+                        "Worth a look"
+                      }/>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Dynasty Stash */}
+            {dynastyTargets.length > 0 && (
+              <div className="bg-gradient-to-b from-indigo-50 to-white rounded-xl border border-indigo-100 shadow-sm p-4">
+                <div className="flex items-center gap-2 mb-3 pb-2 border-b border-indigo-100">
+                  <span className="text-lg">📦</span>
+                  <div>
+                    <div className="font-black text-sm text-gray-800">Dynasty Stash</div>
+                    <div className="text-xs text-gray-400">Prospects &amp; long-term assets</div>
+                  </div>
+                </div>
+                <div className="space-y-3">
+                  {dynastyTargets.map((fa, i) => {
+                    const tier = ageTier(fa.age || 25);
+                    return (
+                      <SmartTargetCard key={fa.id} fa={fa} rank={i+1}
+                        reason={
+                          fa.isMinors ? `${tier.label} — stash while available` :
+                          (fa.age||99) <= 22 ? "Elite prospect window — grab now" :
+                          (fa.age||99) <= 25 ? "Prime upside years ahead" :
+                          "Young piece with dynasty value"
+                        }/>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Fill Your Holes */}
+            {needFills.length > 0 && (
+              <div className="bg-gradient-to-b from-red-50 to-white rounded-xl border border-red-100 shadow-sm p-4">
+                <div className="flex items-center gap-2 mb-3 pb-2 border-b border-red-100">
+                  <span className="text-lg">🚨</span>
+                  <div>
+                    <div className="font-black text-sm text-gray-800">Fill Your Holes</div>
+                    <div className="text-xs text-gray-400">Addresses critical needs</div>
+                  </div>
+                </div>
+                <div className="space-y-3">
+                  {needFills.map(({ need, player }) => (
+                    <SmartTargetCard key={player.id} fa={player}
+                      reason={`Best available ${need.label} — ${need.note}`}/>
+                  ))}
+                </div>
+                {needFills.length === 0 && (
+                  <p className="text-xs text-gray-400 text-center py-4">No critical needs detected. Import your roster CSV to enable this.</p>
+                )}
+              </div>
+            )}
+
+          </div>
+        </div>
+      )}
+
+      {/* ── Filter controls ── */}
+      <div className="bg-white rounded-xl shadow p-4 mb-4">
+        <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Full List</div>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex gap-2 flex-wrap">
+            {[
+              ["targets",  `⭐ Top Targets (${scored.filter(p=>p._verdict!=="Pass").length})`],
+              ["hitters",  `🏏 Hitters (${scored.filter(p=>p.type==="hitter").length})`],
+              ["pitchers", `⚾ Pitchers (${scored.filter(p=>p.type==="pitcher").length})`],
+              ["all",      `📋 All (${scored.length})`],
+            ].map(([key, label]) => (
+              <button key={key} onClick={() => setFaFilter(key)}
+                className={`px-4 py-1.5 rounded-full text-xs font-medium transition-colors ${faFilter===key?"bg-blue-600 text-white":"bg-gray-100 text-gray-600 hover:bg-gray-200"}`}>
+                {label}
+              </button>
+            ))}
+          </div>
+          <div className="flex items-center gap-2">
+            <label className="text-xs text-gray-500">Position:</label>
+            <select value={posFilter} onChange={e => setPosFilter(e.target.value)}
+              className="border rounded-lg px-2 py-1 text-xs focus:outline-none focus:border-blue-400">
+              {POS_OPTIONS.map(p => <option key={p} value={p}>{p === "all" ? "All" : p}</option>)}
+            </select>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Player cards ── */}
+      {displayed.length === 0 ? (
+        <div className="bg-white rounded-xl shadow p-10 text-center">
+          <div className="text-3xl mb-2">🔍</div>
+          <p className="text-gray-500 text-sm">No players match the current filter.</p>
+          <button onClick={() => { setFaFilter("all"); setPosFilter("all"); }}
+            className="mt-3 text-blue-600 text-xs hover:underline">Clear filters</button>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {displayed.map(fa => (
+            <FaCard key={fa.id} fa={fa} roster={roster} posNeeds={positionNeeds}
+              catNeeds={categoryNeeds} remainingFaab={remaining} onRemove={removeFa}/>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FaAnalyzerTab({ roster, league, onFaabChange }) {
+  const [faPlayers,  setFaPlayers]  = useState([]);   // players user has selected to evaluate
+  const [importPool, setImportPool] = useState([]);   // all players from last FA CSV upload
+  const [faabInput,  setFaabInput]  = useState(String(league.remainingFaab));
+  const [mlbDir,     setMlbDir]     = useState([]);
+  const [dirLoading, setDirLoading] = useState(false);
+  const [dirLoaded,  setDirLoaded]  = useState(false);
+  const [dirError,   setDirError]   = useState(null);
+  const [lastUpdated,setLastUpdated]= useState(null);
+  const [faFilter,   setFaFilter]   = useState("targets");
+  const [posFilter,  setPosFilter]  = useState("all");
+  const fileRef = useRef();
+
+  const remaining = parseInt(faabInput)||0;
+  const { positionNeeds, categoryNeeds } = useMemo(()=>roster ? analyzeNeeds(roster) : { positionNeeds:[], categoryNeeds:[] },[roster]);
+
+  const ownedNames = useMemo(()=>
+    new Set((roster?.all||[]).map(p=>p.name)),
+  [roster]);
+
+  // IDs of players already in the evaluation list (to show "✓ Evaluating" in picker)
+  const addedIds = useMemo(() => new Set(faPlayers.map(p => p.id)), [faPlayers]);
+
+  const addFa    = (fa) => setFaPlayers(p => p.some(x => x.id === fa.id) ? p : [fa, ...p]);
+  const removeFa = (id) => setFaPlayers(p => p.filter(x => x.id !== id));
+  const clearPool = () => setImportPool([]);
+
+  // Load live MLB + AAA player directory from MLB Stats API
+  const loadDirectory = async () => {
+    setDirLoading(true); setDirError(null);
+    try {
+      const players = await fetchMLBDirectory();
+      setMlbDir(players);
+      setDirLoaded(true);
+      setLastUpdated(new Date().toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit"}));
+    } catch(e) {
+      setDirError("Could not reach MLB Stats API. Check your internet connection and try again.");
+    } finally {
+      setDirLoading(false);
+    }
+  };
+
+  // Import FA CSV → score all players → populate import pool for selection
+  // Auto-detects Fantrax format: "Players → Free Agents" flat export vs "Team Roster" sectioned export
+  const handleFaFile = (file) => {
+    if (!file?.name.endsWith(".csv")) return;
+    const reader = new FileReader();
+    reader.onload = e => {
+      try {
+        const text  = e.target.result;
+        const lines = text.split(/\r?\n/).filter(l => l.trim());
+
+        // Detect format: FA export has "FP/G" column in header; roster export has section headers
+        const firstLine   = lines[0] || "";
+        const isFAExport  = parseCSVLine(firstLine).some(h => h.replace(/"/g,"").trim() === "FP/G");
+        const rawPlayers  = isFAExport
+          ? parseFantraxFACSV(text)
+          : parseFantraxCSV(text).all;
+
+        if (rawPlayers.length === 0) return;
+
+        const active = roster ? roster.all.filter(p => p.status === "Act") : [];
+        const ts     = Date.now();
+
+        const pool = rawPlayers.map((p, idx) => {
+          const fa = {
+            ...p,
+            id:         `fa-csv-${p.id || p.name}-${ts}-${idx}`,
+            fromImport: true,
+          };
+          const { score: fitScore } = faFitScore(fa, positionNeeds, categoryNeeds, active);
+          const ds       = dynastyScore(fa);
+          const verdict  = faVerdict(fitScore, ds);
+          const combined = fitScore * 0.65 + ds * 0.35;
+          return { ...fa, _fitScore: fitScore, _dynastyScore: ds, _verdict: verdict.label, _combined: combined };
+        }).sort((a, b) => b._combined - a._combined);
+
+        setImportPool(pool);
+      } catch(_) {}
+    };
+    reader.readAsText(file);
+  };
+
+  const sevColor = (s) => s==="critical"?"bg-red-100 text-red-700 border-red-200":s==="moderate"?"bg-yellow-100 text-yellow-700 border-yellow-200":"bg-blue-100 text-blue-700 border-blue-200";
+  const catSevColor = (s) => s==="high"?"bg-red-100 text-red-700":s==="medium"?"bg-yellow-100 text-yellow-700":"bg-gray-100 text-gray-600";
+
+  return (
+    <div className="space-y-5">
+
+      {/* ── Live Player Directory ── */}
+      <div className={`rounded-xl border-2 p-5 ${dirLoaded?"border-green-200 bg-green-50":"border-dashed border-blue-200 bg-blue-50"}`}>
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div>
+            <h3 className="font-bold text-gray-800 text-sm flex items-center gap-2">
+              🌐 Live MLB + AAA Player Directory
+              {dirLoaded && <span className="text-xs font-normal text-green-600 bg-green-100 px-2 py-0.5 rounded-full">✓ {mlbDir.length.toLocaleString()} players loaded</span>}
+            </h3>
+            <p className="text-xs text-gray-500 mt-0.5">
+              {dirLoaded
+                ? `Last updated ${lastUpdated} — stats reflect current ${CURRENT_SEASON} season. Click Refresh to get today's numbers.`
+                : `Pull current season stats from MLB Stats API. Automatically converts to your league's fantasy point system.`}
+            </p>
+            {dirError && <p className="text-xs text-red-600 mt-1">⚠ {dirError}</p>}
+          </div>
+          <div className="flex gap-2 shrink-0">
+            <button
+              onClick={loadDirectory}
+              disabled={dirLoading}
+              className={`text-sm font-semibold px-5 py-2 rounded-lg transition-colors ${dirLoading?"bg-gray-300 text-gray-500 cursor-not-allowed":dirLoaded?"bg-green-600 hover:bg-green-700 text-white":"bg-blue-600 hover:bg-blue-700 text-white"}`}>
+              {dirLoading ? "⏳ Loading…" : dirLoaded ? "🔄 Refresh" : "⬇ Load Players"}
+            </button>
+          </div>
+        </div>
+        {dirLoaded && (
+          <div className="mt-3 grid grid-cols-3 gap-3 text-center text-xs">
+            {[
+              ["MLB Hitters", mlbDir.filter(p=>p.type==="hitter"&&!p.isMinors).length, "text-amber-700"],
+              ["MLB Pitchers", mlbDir.filter(p=>p.type==="pitcher"&&!p.isMinors).length, "text-blue-700"],
+              ["AAA Prospects", mlbDir.filter(p=>p.isMinors).length, "text-purple-700"],
+            ].map(([label,count,color])=>(
+              <div key={label} className="bg-white rounded-lg py-2 shadow-sm">
+                <div className={`text-lg font-black ${color}`}>{count}</div>
+                <div className="text-gray-500">{label}</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* FAAB Budget */}
+      <div className="bg-slate-800 rounded-xl p-5 text-white">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div className="flex-1">
+            <h3 className="font-bold text-sm mb-1">FAAB Budget Tracker</h3>
+            <FaabBar remaining={remaining} total={league.totalFaab}/>
+          </div>
+          <div className="flex items-center gap-3">
+            <div>
+              <label className="text-xs text-slate-400 block mb-1">Remaining FAAB ($)</label>
+              <input type="number" min="0" className="border border-slate-600 bg-slate-700 text-white rounded-lg px-3 py-1.5 text-sm w-28 focus:outline-none focus:border-blue-400"
+                value={faabInput} onChange={e=>{ setFaabInput(e.target.value); onFaabChange(parseInt(e.target.value)||0); }}/>
+            </div>
+            <div className="text-center">
+              <div className="text-xs text-slate-400">% Used</div>
+              <div className="text-2xl font-black">{league.totalFaab>0?Math.round((1-remaining/league.totalFaab)*100):0}%</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Team Needs */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+        <div className="bg-white rounded-xl shadow p-5">
+          <h3 className="font-bold text-gray-800 text-sm mb-3">📍 Position Needs</h3>
+          {positionNeeds.length===0
+            ? <p className="text-xs text-green-600">✅ All positions are adequately covered.</p>
+            : <div className="space-y-2">
+                {positionNeeds.map(n=>(
+                  <div key={n.pos} className={`flex items-center justify-between rounded-lg px-3 py-2 border text-xs ${sevColor(n.severity)}`}>
+                    <div className="flex items-center gap-2">
+                      <span className={`font-bold px-1.5 py-0.5 rounded-full ${posColor(n.pos)}`}>{n.pos}</span>
+                      <span className="font-semibold">{n.label}</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span>{n.note}</span>
+                      <span className="font-bold uppercase">{n.severity}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+          }
+        </div>
+        <div className="bg-white rounded-xl shadow p-5">
+          <h3 className="font-bold text-gray-800 text-sm mb-3">📊 Category Weaknesses</h3>
+          {categoryNeeds.length===0
+            ? <p className="text-xs text-green-600">✅ Solid across all categories.</p>
+            : <div className="space-y-2">
+                {categoryNeeds.map(c=>(
+                  <div key={c.cat} className={`flex items-center justify-between rounded-lg px-3 py-2 text-xs font-medium ${catSevColor(c.severity)}`}>
+                    <span>{c.icon} {c.cat}</span>
+                    <span>{c.rate}</span>
+                  </div>
+                ))}
+              </div>
+          }
+        </div>
+      </div>
+
+      {/* Add FA players */}
+      <FaForm onAdd={addFa} mlbDir={mlbDir} ownedNames={ownedNames}/>
+
+      {/* ── Lineup vs FA Comparison ── */}
+      <LineupVsFACompare
+        roster={roster}
+        mlbDir={mlbDir}
+        positionNeeds={positionNeeds}
+        categoryNeeds={categoryNeeds}
+        remaining={remaining}
+      />
+
+      {/* ── Import FA CSV ── */}
+      <div className="bg-white rounded-xl shadow p-5">
+        <div className="flex items-center justify-between mb-2">
+          <div>
+            <h3 className="font-bold text-gray-800 text-sm">Import FA List from Fantrax</h3>
+            <p className="text-xs text-gray-400 mt-0.5">Upload your free agent CSV and we'll rank every player for your team — then you pick who to evaluate.</p>
+          </div>
+          <button onClick={()=>fileRef.current?.click()}
+            className="shrink-0 bg-slate-700 hover:bg-slate-900 text-white text-xs font-semibold px-4 py-2 rounded-lg transition-colors flex items-center gap-1.5">
+            📁 Upload FA CSV
+          </button>
+          <input ref={fileRef} type="file" accept=".csv" className="hidden" onChange={e=>handleFaFile(e.target.files[0])}/>
+        </div>
+        <p className="text-xs text-gray-400">In Fantrax: <strong>Players → Free Agents</strong> → scroll to bottom → <strong>Export → CSV</strong>.</p>
+      </div>
+
+      {/* ── Target Picker (shown after FA CSV import) ── */}
+      {importPool.length > 0 && (
+        <ImportTargetPicker
+          pool={importPool}
+          roster={roster}
+          positionNeeds={positionNeeds}
+          categoryNeeds={categoryNeeds}
+          remaining={remaining}
+          addedIds={addedIds}
+          onAdd={addFa}
+          onClear={clearPool}
+        />
+      )}
+
+      {/* ── Evaluation List (manually added + selected from picker) ── */}
+      {faPlayers.length > 0 && (
+        <div>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="font-bold text-gray-800 text-sm">📋 Evaluation List ({faPlayers.length} players)</h3>
+            <button onClick={() => setFaPlayers([])} className="text-xs text-gray-400 hover:text-red-400 transition-colors">✕ Clear all</button>
+          </div>
+          <FaResults
+            faPlayers={faPlayers}
+            roster={roster}
+            positionNeeds={positionNeeds}
+            categoryNeeds={categoryNeeds}
+            remaining={remaining}
+            faFilter={faFilter}
+            posFilter={posFilter}
+            setFaFilter={setFaFilter}
+            setPosFilter={setPosFilter}
+            removeFa={removeFa}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   LINEUP VS FA COMPARISON
+   ═══════════════════════════════════════════════════════════════ */
+
+function LineupVsFACompare({ roster, mlbDir, positionNeeds, categoryNeeds, remaining }) {
+  const [rosterPlayer, setRosterPlayer] = useState(null);
+  const [faPlayer,     setFaPlayer]     = useState(null);
+  const [faQuery,      setFaQuery]      = useState("");
+  const [faOpen,       setFaOpen]       = useState(false);
+
+  /* ── helpers ─────────────────────────────────────────────── */
+  function dynastyWindow(age) {
+    if (!age) return "";
+    if (age <= 23) return "10+ yr window";
+    if (age <= 26) return "7–8 yr window";
+    if (age <= 29) return "4–5 yr window";
+    if (age <= 32) return "1–2 yr window";
+    return "End of window";
+  }
+
+  /* ── search FA in mlbDir ─────────────────────────────────── */
+  const faResults = useMemo(() => {
+    if (!faQuery || faQuery.length < 2) return [];
+    const q = faQuery.toLowerCase();
+    return mlbDir.filter(p => p.name.toLowerCase().includes(q)).slice(0, 8);
+  }, [faQuery, mlbDir]);
+
+  /* ── roster player list ──────────────────────────────────── */
+  const active   = (roster?.all || []).filter(p => p.status === "Act");
+  const reserve  = (roster?.all || []).filter(p => p.status === "Res");
+
+  /* ── scoring ─────────────────────────────────────────────── */
+  function prodScore(p) {
+    if (!p) return 0;
+    if (p.type === "pitcher") {
+      let s = 50;
+      if (p.era > 0) s += Math.max(-25, Math.min(25, (4.00 - p.era) * 8));
+      if (p.fpAvg > 0) s += Math.min(25, p.fpAvg * 1.5);
+      return Math.max(0, Math.min(100, s));
+    }
+    let s = 50;
+    if (p.fpAvg > 0) s += Math.min(25, p.fpAvg * 2);
+    if (p.hr  > 0)   s += Math.min(10, p.hr  / 3);
+    if (p.sb  > 0)   s += Math.min(10, p.sb  / 2);
+    return Math.max(0, Math.min(100, s));
+  }
+
+  function dsFor(p) { return p ? dynastyScore(p) : 0; }
+
+  const rprod = prodScore(rosterPlayer);
+  const fprod = prodScore(faPlayer);
+  const rds   = dsFor(rosterPlayer);
+  const fds   = dsFor(faPlayer);
+
+  const prodAdv = fprod - rprod;   // positive = FA is better
+  const dsAdv   = fds   - rds;
+
+  // For a direct swap: production weighted slightly more (55%) than dynasty (45%)
+  const overall = prodAdv * 0.55 + dsAdv * 0.45;
+
+  function verdict() {
+    if (!rosterPlayer || !faPlayer) return null;
+    if (overall >= 20) return { label: "Clear Upgrade 🔥",        color: "bg-green-100 text-green-800 border-green-300",  desc: "Make this move — significant improvement." };
+    if (overall >=  8) return { label: "Slight Upgrade ✅",        color: "bg-emerald-50 text-emerald-700 border-emerald-200", desc: "Lean toward adding the FA. Modest gain." };
+    if (overall >= -8) return { label: "Too Close to Call ⚖️",    color: "bg-amber-50 text-amber-700 border-amber-200",  desc: "Nearly identical value. Consider position fit & FAAB." };
+    if (overall >= -20) return { label: "Keep Your Player 🛡️",    color: "bg-orange-50 text-orange-700 border-orange-200", desc: "Your current player has the edge. Hold." };
+    return              { label: "Definitely Keep ❌",             color: "bg-red-50 text-red-700 border-red-200",        desc: "Don't make this move." };
+  }
+
+  const v = verdict();
+
+  /* Position fit warning */
+  function posWarn() {
+    if (!rosterPlayer || !faPlayer) return null;
+    const rPos = rosterPlayer.pos;
+    const faEligible = (faPlayer.eligible || faPlayer.pos || "").split(",").map(s => s.trim());
+    if (!faEligible.includes(rPos) && rPos) {
+      return `⚠️ ${faPlayer.name} isn't eligible at ${rPos}. Check your roster flexibility before making this move.`;
+    }
+    return null;
+  }
+
+  /* ── Stat Row ────────────────────────────────────────────── */
+  function StatRow({ label, rVal, fVal, higherBetter = true }) {
+    const rN = parseFloat(rVal) || 0;
+    const fN = parseFloat(fVal) || 0;
+    const rWins = higherBetter ? rN > fN : rN < fN;
+    const fWins = higherBetter ? fN > rN : fN < rN;
+    return (
+      <div className="grid grid-cols-3 text-xs py-1 border-b border-gray-100 last:border-0">
+        <span className={`text-right pr-3 font-semibold ${rWins ? "text-green-600" : "text-gray-500"}`}>{rVal ?? "—"}</span>
+        <span className="text-center text-gray-400 font-medium">{label}</span>
+        <span className={`text-left pl-3 font-semibold ${fWins ? "text-green-600" : "text-gray-500"}`}>{fVal ?? "—"}</span>
+      </div>
+    );
+  }
+
+  /* ── Player Card ─────────────────────────────────────────── */
+  function CompareCard({ player, side }) {
+    if (!player) return (
+      <div className={`flex-1 rounded-xl border-2 border-dashed flex items-center justify-center h-48 ${side === "roster" ? "border-slate-200" : "border-blue-200"}`}>
+        <span className="text-gray-300 text-sm">{side === "roster" ? "Select from lineup →" : "← Search free agent"}</span>
+      </div>
+    );
+    const ds = dynastyScore(player);
+    const dStars = ds >= 75 ? "★★★★★" : ds >= 60 ? "★★★★" : ds >= 45 ? "★★★" : ds >= 30 ? "★★" : "★";
+    const win = dynastyWindow(player.age);
+    return (
+      <div className={`flex-1 rounded-xl border p-4 ${side === "roster" ? "border-slate-300 bg-slate-50" : "border-blue-300 bg-blue-50"}`}>
+        <div className="flex items-start justify-between mb-2">
+          <div>
+            <div className="flex items-center gap-2 mb-0.5">
+              <span className={`text-xs font-bold px-1.5 py-0.5 rounded ${side === "roster" ? "bg-slate-200 text-slate-700" : "bg-blue-200 text-blue-800"}`}>{player.pos}</span>
+              <span className="text-xs text-gray-400">{player.team}</span>
+            </div>
+            <div className="font-bold text-gray-800 text-sm leading-tight">{player.name}</div>
+            {player.age > 0 && <div className="text-xs text-gray-400">Age {player.age} · {win}</div>}
+          </div>
+          <div className="text-right">
+            <div className="text-yellow-500 text-xs tracking-tight">{dStars}</div>
+            <div className="text-xs text-gray-400">DS {ds}</div>
+          </div>
+        </div>
+        <div className="mt-3 space-y-0.5">
+          {player.type !== "pitcher" ? (
+            <>
+              <StatRow label="FP/G" rVal={side==="roster"?player.fpAvg?.toFixed(1):undefined} fVal={side==="fa"?player.fpAvg?.toFixed(1):undefined} />
+              {player.hr  > 0 && <StatRow label="HR"  rVal={side==="roster"?player.hr:undefined}  fVal={side==="fa"?player.hr:undefined}  />}
+              {player.sb  > 0 && <StatRow label="SB"  rVal={side==="roster"?player.sb:undefined}  fVal={side==="fa"?player.sb:undefined}  />}
+              {player.rbi > 0 && <StatRow label="RBI" rVal={side==="roster"?player.rbi:undefined} fVal={side==="fa"?player.rbi:undefined} />}
+            </>
+          ) : (
+            <>
+              <StatRow label="FP/G" rVal={side==="roster"?player.fpAvg?.toFixed(1):undefined} fVal={side==="fa"?player.fpAvg?.toFixed(1):undefined} />
+              {player.era > 0 && <StatRow label="ERA" rVal={side==="roster"?(player.era?.toFixed(2)):undefined} fVal={side==="fa"?(player.era?.toFixed(2)):undefined} higherBetter={false}/>}
+              {player.sv  > 0 && <StatRow label="SV"  rVal={side==="roster"?player.sv:undefined}  fVal={side==="fa"?player.sv:undefined}  />}
+              {player.k   > 0 && <StatRow label="K"   rVal={side==="roster"?player.k:undefined}   fVal={side==="fa"?player.k:undefined}   />}
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  /* ── Comparison Table (middle) ───────────────────────────── */
+  function CompareTable() {
+    if (!rosterPlayer || !faPlayer) return null;
+    const rp = rosterPlayer, fp = faPlayer;
+    const isHitter = rp.type !== "pitcher" || fp.type !== "pitcher";
+    return (
+      <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-4 w-full max-w-md mx-auto">
+        <div className="grid grid-cols-3 text-xs font-bold text-gray-500 mb-2">
+          <span className="text-right pr-3 truncate">{rp.name.split(" ").slice(-1)[0]}</span>
+          <span className="text-center">Stat</span>
+          <span className="text-left pl-3 truncate">{fp.name.split(" ").slice(-1)[0]}</span>
+        </div>
+        <StatRow label="FP/G"  rVal={rp.fpAvg?.toFixed(1)}  fVal={fp.fpAvg?.toFixed(1)} />
+        <StatRow label="Dynasty" rVal={dsFor(rp)} fVal={dsFor(fp)} />
+        <StatRow label="Age"   rVal={rp.age||"?"} fVal={fp.age||"?"} higherBetter={false}/>
+        {isHitter ? (
+          <>
+            {(rp.hr||fp.hr)   > 0 && <StatRow label="HR"  rVal={rp.hr}  fVal={fp.hr}  />}
+            {(rp.sb||fp.sb)   > 0 && <StatRow label="SB"  rVal={rp.sb}  fVal={fp.sb}  />}
+            {(rp.rbi||fp.rbi) > 0 && <StatRow label="RBI" rVal={rp.rbi} fVal={fp.rbi} />}
+            {(rp.r||fp.r)     > 0 && <StatRow label="R"   rVal={rp.r}   fVal={fp.r}   />}
+          </>
+        ) : (
+          <>
+            {(rp.era||fp.era) > 0 && <StatRow label="ERA" rVal={rp.era?.toFixed(2)} fVal={fp.era?.toFixed(2)} higherBetter={false}/>}
+            {(rp.k||fp.k)     > 0 && <StatRow label="K"   rVal={rp.k}   fVal={fp.k}   />}
+            {(rp.sv||fp.sv)   > 0 && <StatRow label="SV"  rVal={rp.sv}  fVal={fp.sv}  />}
+            {(rp.w||fp.w)     > 0 && <StatRow label="W"   rVal={rp.w}   fVal={fp.w}   />}
+          </>
+        )}
+      </div>
+    );
+  }
+
+  /* ── render ─────────────────────────────────────────────── */
+  return (
+    <div className="bg-white rounded-xl shadow p-5 space-y-4">
+      <div>
+        <h3 className="font-bold text-gray-800 text-sm">⚔️ Lineup vs Free Agent</h3>
+        <p className="text-xs text-gray-400 mt-0.5">Pick someone from your active lineup and a free agent — we'll tell you if the swap is worth it.</p>
+      </div>
+
+      {/* Selectors row */}
+      <div className="flex flex-col sm:flex-row gap-3">
+        {/* Roster picker */}
+        <div className="flex-1">
+          <label className="block text-xs font-medium text-gray-500 mb-1">Your Lineup Player</label>
+          <select
+            className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-slate-400"
+            value={rosterPlayer?.id || ""}
+            onChange={e => {
+              const id = e.target.value;
+              const all = roster?.all || [];
+              setRosterPlayer(all.find(p => p.id === id) || null);
+            }}
+          >
+            <option value="">— Select a player —</option>
+            {active.length > 0 && (
+              <optgroup label="Active">
+                {active.map(p => <option key={p.id} value={p.id}>{p.name} ({p.pos})</option>)}
+              </optgroup>
+            )}
+            {reserve.length > 0 && (
+              <optgroup label="Reserve / IL">
+                {reserve.map(p => <option key={p.id} value={p.id}>{p.name} ({p.pos})</option>)}
+              </optgroup>
+            )}
+          </select>
+        </div>
+
+        <div className="flex items-end justify-center pb-2">
+          <span className="text-gray-300 font-bold text-xl">vs</span>
+        </div>
+
+        {/* FA search */}
+        <div className="flex-1 relative">
+          <label className="block text-xs font-medium text-gray-500 mb-1">Free Agent</label>
+          <input
+            type="text"
+            placeholder={mlbDir.length === 0 ? "Load player directory first ↑" : "Search free agents…"}
+            disabled={mlbDir.length === 0}
+            value={faQuery}
+            onChange={e => { setFaQuery(e.target.value); setFaOpen(true); setFaPlayer(null); }}
+            onFocus={() => setFaOpen(true)}
+            onBlur={() => setTimeout(() => setFaOpen(false), 150)}
+            className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 disabled:bg-gray-50 disabled:text-gray-400"
+          />
+          {faOpen && faResults.length > 0 && (
+            <div className="absolute z-20 left-0 right-0 mt-1 bg-white border border-gray-200 rounded-lg shadow-lg max-h-48 overflow-y-auto">
+              {faResults.map(p => (
+                <button
+                  key={p.id}
+                  onMouseDown={() => { setFaPlayer(p); setFaQuery(p.name); setFaOpen(false); }}
+                  className="w-full text-left px-3 py-2 text-sm hover:bg-blue-50 flex items-center gap-2"
+                >
+                  <span className="text-xs bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded font-bold">{p.pos}</span>
+                  <span className="font-medium text-gray-800">{p.name}</span>
+                  <span className="text-xs text-gray-400 ml-auto">{p.team}</span>
+                </button>
+              ))}
+            </div>
+          )}
+          {faPlayer && (
+            <button onClick={() => { setFaPlayer(null); setFaQuery(""); }} className="absolute right-2 top-7 text-gray-300 hover:text-gray-500 text-lg leading-none">×</button>
+          )}
+        </div>
+      </div>
+
+      {/* Side-by-side cards */}
+      {(rosterPlayer || faPlayer) && (
+        <div className="flex flex-col sm:flex-row gap-3">
+          <CompareCard player={rosterPlayer} side="roster" />
+          <CompareCard player={faPlayer}     side="fa"     />
+        </div>
+      )}
+
+      {/* Comparison table */}
+      <CompareTable />
+
+      {/* Verdict */}
+      {v && (
+        <div className={`rounded-xl border px-5 py-4 ${v.color}`}>
+          <div className="font-bold text-base mb-1">{v.label}</div>
+          <div className="text-xs opacity-80">{v.desc}</div>
+          {posWarn() && <div className="mt-2 text-xs font-medium opacity-90">{posWarn()}</div>}
+          <div className="mt-2 flex gap-4 text-xs opacity-70">
+            <span>Production edge: {prodAdv >= 0 ? "+" : ""}{prodAdv.toFixed(0)} pts ({prodAdv >= 0 ? "FA" : "Current"})</span>
+            <span>Dynasty edge: {dsAdv >= 0 ? "+" : ""}{dsAdv.toFixed(0)} pts ({dsAdv >= 0 ? "FA" : "Current"})</span>
+          </div>
+        </div>
+      )}
+
+      {!rosterPlayer && !faPlayer && (
+        <div className="text-center text-xs text-gray-300 py-4">
+          Select both players above to see the comparison
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   TRADE ANALYSIS
+   ═══════════════════════════════════════════════════════════════ */
+
+/* ── Player search used inside each trade side ─────────────────*/
+function TradeSearch({ dir, excludedNames, onAdd, placeholder }) {
+  const [query, setQuery] = useState("");
+  const [open,  setOpen]  = useState(false);
+
+  const results = useMemo(() => {
+    if (!dir?.length || query.length < 2) return [];
+    const q = query.toLowerCase();
+    return dir
+      .filter(p => p.name.toLowerCase().includes(q) && !(excludedNames||new Set()).has(p.name))
+      .slice(0, 14);
+  }, [query, dir, excludedNames]);
+
+  const pick = (p) => {
+    onAdd({
+      id: `trade-${Date.now()}-${p.mlbId||p.id}`,
+      name: p.name, team: p.team, pos: p.pos,
+      eligible: p.eligible || p.pos, type: p.type,
+      age: p.age || 0, isProspect: !!p.isProspect, isMinors: !!p.isMinors,
+      fpAvg: p.fpAvg || 0, fpTotal: p.fpTotal || 0, gp: p.gp || 0,
+      hr: p.hr||0, sb: p.sb||0, rbi: p.rbi||0,
+      ip: p.ip||0, era: p.era||0, k: p.k||0, sv: p.sv||0, qs: p.qs||0,
+    });
+    setQuery(""); setOpen(false);
+  };
+
+  return (
+    <div className="relative">
+      <input
+        className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-400 bg-white"
+        placeholder={placeholder || "Search player name…"}
+        value={query}
+        onChange={e => { setQuery(e.target.value); setOpen(true); }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setTimeout(() => setOpen(false), 200)}
+      />
+      {open && results.length > 0 && (
+        <div className="absolute z-50 left-0 right-0 bg-white border border-gray-200 rounded-xl shadow-xl mt-1 max-h-72 overflow-y-auto">
+          {results.map(p => (
+            <button
+              key={p.id}
+              type="button"
+              onMouseDown={() => pick(p)}
+              className="w-full text-left px-4 py-2.5 hover:bg-gray-50 border-b border-gray-100 last:border-0 flex items-center gap-3">
+              <span className={`text-xs font-bold px-1.5 py-0.5 rounded-full shrink-0 ${posColor(p.pos)}`}>{p.pos}</span>
+              <div className="min-w-0 flex-1">
+                <span className="font-semibold text-sm text-gray-900">{p.name}</span>
+                <span className="text-xs text-gray-400 ml-2">{p.team} · Age {p.age||"?"}</span>
+                {p.isMinors && <span className="ml-1.5 text-xs bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded-full font-semibold">AAA</span>}
+              </div>
+              <span className="text-xs text-gray-400 shrink-0">{(p.fpAvg||0).toFixed(1)} pts/gm</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ── Compact player chip inside trade builder ──────────────────*/
+function TradePlayerCard({ player, onRemove }) {
+  const ds   = dynastyScore(player);
+  const tier = ageTier(player.age || 25);
+
+  function dynWindow(age) {
+    if (!age) return "Age unknown";
+    if (age <= 22) return "10+ yr window";
+    if (age <= 25) return "7–8 yr window";
+    if (age <= 27) return "4–5 yr window";
+    if (age <= 30) return "2–3 yr window";
+    return "Win-now only";
+  }
+
+  return (
+    <div className="flex items-start justify-between gap-2 bg-white border border-gray-100 rounded-xl p-3.5 shadow-sm">
+      <div className="flex items-start gap-2.5 flex-1 min-w-0">
+        <span className={`text-xs font-bold px-1.5 py-0.5 rounded-full shrink-0 mt-0.5 ${posColor(player.pos)}`}>{player.pos}</span>
+        <div className="min-w-0">
+          <div className="font-bold text-gray-900 text-sm truncate">{player.name}</div>
+          <div className="text-xs text-gray-400">{player.team} · Age {player.age||"?"}</div>
+          <div className="flex items-center gap-2 mt-1 flex-wrap">
+            <div className="flex items-center gap-1"><Stars n={tier.stars}/></div>
+            <span className={`text-xs font-semibold ${tier.color}`}>{tier.label}</span>
+            <span className="text-gray-300">·</span>
+            <span className="text-xs text-gray-400 italic">{dynWindow(player.age)}</span>
+          </div>
+          <div className="text-xs text-gray-500 mt-1">
+            <span className="font-semibold text-gray-700">{(player.fpAvg||0).toFixed(1)}</span> pts/gm
+            <span className="mx-1.5 text-gray-200">·</span>
+            Dynasty <span className="font-semibold text-gray-700">{ds}</span>/100
+            {player.isMinors && <span className="ml-2 bg-purple-100 text-purple-700 text-xs px-1.5 py-0.5 rounded-full font-semibold">AAA</span>}
+            {!player.isMinors && player.isProspect && <span className="ml-2 bg-emerald-100 text-emerald-700 text-xs px-1.5 py-0.5 rounded-full font-semibold">Prospect</span>}
+          </div>
+        </div>
+      </div>
+      <button onClick={onRemove} className="text-gray-300 hover:text-red-400 transition-colors text-lg leading-none shrink-0 mt-0.5">✕</button>
+    </div>
+  );
+}
+
+/* ── Trade Analysis Panel ──────────────────────────────────────*/
+function TradeAnalysisPanel({ givePlayers, recvPlayers, roster, positionNeeds, categoryNeeds }) {
+  // ── Per-player scores ──
+  const giveScores = givePlayers.map(p => ({ ...p, ds: dynastyScore(p) }));
+  const recvScores = recvPlayers.map(p => ({ ...p, ds: dynastyScore(p) }));
+
+  const totalGiveDs   = giveScores.reduce((s, p) => s + p.ds, 0);
+  const totalRecvDs   = recvScores.reduce((s, p) => s + p.ds, 0);
+  const totalGiveProd = givePlayers.reduce((s, p) => s + (p.fpAvg || 0), 0);
+  const totalRecvProd = recvPlayers.reduce((s, p) => s + (p.fpAvg || 0), 0);
+
+  // ── Category delta (hitters: HR/SB/RBI; pitchers: K/SV/QS) ──
+  const catDelta = {
+    hr:  recvPlayers.reduce((s,p)=>s+(p.hr||0),0)  - givePlayers.reduce((s,p)=>s+(p.hr||0),0),
+    sb:  recvPlayers.reduce((s,p)=>s+(p.sb||0),0)  - givePlayers.reduce((s,p)=>s+(p.sb||0),0),
+    rbi: recvPlayers.reduce((s,p)=>s+(p.rbi||0),0) - givePlayers.reduce((s,p)=>s+(p.rbi||0),0),
+    k:   recvPlayers.reduce((s,p)=>s+(p.k||0),0)   - givePlayers.reduce((s,p)=>s+(p.k||0),0),
+    sv:  recvPlayers.reduce((s,p)=>s+(p.sv||0),0)  - givePlayers.reduce((s,p)=>s+(p.sv||0),0),
+    qs:  recvPlayers.reduce((s,p)=>s+(p.qs||0),0)  - givePlayers.reduce((s,p)=>s+(p.qs||0),0),
+  };
+
+  // ── Position impact (needs fixed vs needs vacated) ──
+  const needsFilled   = positionNeeds.filter(n =>
+    recvPlayers.some(p => p.type === n.type && eligibleFor(p, n.pos)) &&
+    !givePlayers.some(p => p.type === n.type && eligibleFor(p, n.pos))
+  ).length;
+  const needsVacated  = positionNeeds.filter(n =>
+    givePlayers.some(p => p.type === n.type && eligibleFor(p, n.pos)) &&
+    !recvPlayers.some(p => p.type === n.type && eligibleFor(p, n.pos))
+  ).length;
+
+  // ── Overall verdict (dynasty-weighted for dynasty league) ──
+  const dsTotal    = Math.max(totalGiveDs + totalRecvDs, 1);
+  const dynastyAdv = ((totalRecvDs   - totalGiveDs)   / dsTotal) * 100;
+  const prodTotal  = Math.max(totalGiveProd + totalRecvProd, 0.01);
+  const prodAdv    = ((totalRecvProd - totalGiveProd)  / prodTotal) * 100;
+  const posAdv     = (needsFilled - needsVacated) * 15;
+  const overallAdv = dynastyAdv * 0.45 + prodAdv * 0.40 + posAdv * 0.15;
+
+  const verdict =
+    overallAdv >= 22  ? { label:"You Win",              emoji:"🏆", color:"bg-green-600",  text:"text-green-700",  border:"border-green-200 bg-green-50"  } :
+    overallAdv >= 8   ? { label:"Slight Edge Your Way", emoji:"✅", color:"bg-blue-500",   text:"text-blue-700",   border:"border-blue-200 bg-blue-50"    } :
+    overallAdv >= -8  ? { label:"Fair Trade",           emoji:"⚖️", color:"bg-slate-500",  text:"text-slate-700",  border:"border-slate-200 bg-slate-50"  } :
+    overallAdv >= -22 ? { label:"Slight Disadvantage",  emoji:"⚠️", color:"bg-orange-500", text:"text-orange-700", border:"border-orange-200 bg-orange-50" } :
+                        { label:"You Lose",              emoji:"❌", color:"bg-red-600",    text:"text-red-700",    border:"border-red-200 bg-red-50"      };
+
+  // ── Helpers ──
+  const ScoreBar = ({ value, max, color }) => {
+    const pct = max > 0 ? Math.min(100, (value / max) * 100) : 0;
+    return (
+      <div className="flex items-center gap-2">
+        <div className="flex-1 h-3 bg-gray-100 rounded-full overflow-hidden">
+          <div className={`h-full rounded-full ${color}`} style={{width:`${pct}%`}}/>
+        </div>
+        <span className="text-sm font-black w-8 text-right">{Math.round(value)}</span>
+      </div>
+    );
+  };
+
+  const DeltaChip = ({ label, val, icon }) => {
+    if (val === 0) return null;
+    const pos = val > 0;
+    return (
+      <div className={`flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded-full ${pos?"bg-green-100 text-green-700":"bg-red-100 text-red-700"}`}>
+        <span>{icon}</span>
+        <span>{label}</span>
+        <span>{pos?"+":""}{val}</span>
+      </div>
+    );
+  };
+
+  const maxDs   = Math.max(totalGiveDs, totalRecvDs, 1);
+  const maxProd = Math.max(totalGiveProd, totalRecvProd, 0.1);
+
+  const hasCatData = givePlayers.some(p => p.hr||p.sb||p.k||p.sv) ||
+                     recvPlayers.some(p => p.hr||p.sb||p.k||p.sv);
+
+  return (
+    <div className="space-y-4">
+
+      {/* ── Verdict Banner ── */}
+      <div className={`rounded-2xl border-2 p-6 ${verdict.border}`}>
+        <div className="flex items-center gap-4 flex-wrap">
+          <div className={`w-14 h-14 rounded-2xl ${verdict.color} flex items-center justify-center text-2xl shadow-sm shrink-0`}>
+            {verdict.emoji}
+          </div>
+          <div className="flex-1 min-w-0">
+            <div className={`text-2xl font-black ${verdict.text}`}>{verdict.label}</div>
+            <div className="text-sm text-gray-500 mt-0.5">
+              {overallAdv > 0
+                ? `You gain ${prodAdv > 0 ? "production" : "dynasty value"}${dynastyAdv > 0 && prodAdv > 0 ? " and dynasty value" : ""}${needsFilled > 0 ? " and fill a positional need" : ""}.`
+                : overallAdv < 0
+                ? `You give up ${-prodAdv > 0 ? "production" : "dynasty value"}${-dynastyAdv > 0 && -prodAdv > 0 ? " and dynasty value" : ""}${needsVacated > 0 ? " and vacate a positional need" : ""}.`
+                : "The value exchanged is roughly balanced across production and dynasty."}
+              {!roster && <span className="ml-2 text-amber-600 text-xs font-medium">⚠ Import roster CSV for positional context.</span>}
+            </div>
+          </div>
+          <div className="text-right shrink-0">
+            <div className="text-xs text-gray-400 uppercase tracking-wide">Trade Score</div>
+            <div className={`text-3xl font-black ${verdict.text}`}>
+              {overallAdv > 0 ? "+" : ""}{Math.round(overallAdv)}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Three analysis columns ── */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+
+        {/* Dynasty Value */}
+        <div className="bg-white rounded-xl shadow p-5">
+          <div className="flex items-center gap-2 mb-4">
+            <span className="text-base">👑</span>
+            <div>
+              <div className="font-black text-sm text-gray-800">Dynasty Value</div>
+              <div className="text-xs text-gray-400">Age tiers · 45% of score</div>
+            </div>
+          </div>
+          <div className="space-y-3">
+            <div>
+              <div className="flex justify-between text-xs mb-1">
+                <span className="text-gray-500 font-medium">You Give</span>
+                <span className={`font-bold ${totalGiveDs > totalRecvDs ? "text-green-600" : "text-gray-600"}`}>{totalGiveDs}</span>
+              </div>
+              <ScoreBar value={totalGiveDs} max={maxDs} color={totalGiveDs >= totalRecvDs ? "bg-green-500" : "bg-gray-300"}/>
+            </div>
+            <div>
+              <div className="flex justify-between text-xs mb-1">
+                <span className="text-gray-500 font-medium">You Receive</span>
+                <span className={`font-bold ${totalRecvDs > totalGiveDs ? "text-green-600" : "text-gray-600"}`}>{totalRecvDs}</span>
+              </div>
+              <ScoreBar value={totalRecvDs} max={maxDs} color={totalRecvDs >= totalGiveDs ? "bg-emerald-500" : "bg-gray-300"}/>
+            </div>
+          </div>
+          <div className={`mt-4 text-xs font-semibold text-center px-3 py-1.5 rounded-lg ${dynastyAdv > 5 ? "bg-green-100 text-green-700" : dynastyAdv < -5 ? "bg-red-100 text-red-700" : "bg-gray-100 text-gray-600"}`}>
+            {dynastyAdv > 5 ? `You gain ${Math.round(dynastyAdv)} dynasty pts` : dynastyAdv < -5 ? `You give ${Math.abs(Math.round(dynastyAdv))} dynasty pts` : "Dynasty value roughly even"}
+          </div>
+
+          {/* Per-player breakdown */}
+          <div className="mt-4 space-y-1.5">
+            {[...giveScores.map(p=>({...p,side:"give"})), ...recvScores.map(p=>({...p,side:"recv"}))].map(p => {
+              const tier = ageTier(p.age||25);
+              return (
+                <div key={p.id} className="flex items-center gap-2 text-xs">
+                  <span className={`w-2 h-2 rounded-full shrink-0 ${p.side==="recv"?"bg-emerald-400":"bg-gray-300"}`}/>
+                  <span className="text-gray-600 flex-1 truncate">{p.name}</span>
+                  <Stars n={tier.stars}/>
+                  <span className={`font-bold w-6 text-right ${p.side==="recv"?"text-emerald-600":"text-gray-500"}`}>{p.ds}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Production */}
+        <div className="bg-white rounded-xl shadow p-5">
+          <div className="flex items-center gap-2 mb-4">
+            <span className="text-base">📈</span>
+            <div>
+              <div className="font-black text-sm text-gray-800">Production</div>
+              <div className="text-xs text-gray-400">Fantasy pts/gm · 40% of score</div>
+            </div>
+          </div>
+          <div className="space-y-3">
+            <div>
+              <div className="flex justify-between text-xs mb-1">
+                <span className="text-gray-500 font-medium">You Give</span>
+                <span className={`font-bold ${totalGiveProd > totalRecvProd ? "text-green-600" : "text-gray-600"}`}>{totalGiveProd.toFixed(1)}/gm</span>
+              </div>
+              <ScoreBar value={totalGiveProd} max={maxProd} color={totalGiveProd >= totalRecvProd ? "bg-green-500" : "bg-gray-300"}/>
+            </div>
+            <div>
+              <div className="flex justify-between text-xs mb-1">
+                <span className="text-gray-500 font-medium">You Receive</span>
+                <span className={`font-bold ${totalRecvProd > totalGiveProd ? "text-green-600" : "text-gray-600"}`}>{totalRecvProd.toFixed(1)}/gm</span>
+              </div>
+              <ScoreBar value={totalRecvProd} max={maxProd} color={totalRecvProd >= totalGiveProd ? "bg-blue-500" : "bg-gray-300"}/>
+            </div>
+          </div>
+          <div className={`mt-4 text-xs font-semibold text-center px-3 py-1.5 rounded-lg ${prodAdv > 5 ? "bg-green-100 text-green-700" : prodAdv < -5 ? "bg-red-100 text-red-700" : "bg-gray-100 text-gray-600"}`}>
+            {prodAdv > 5 ? `+${(totalRecvProd-totalGiveProd).toFixed(1)} pts/gm net gain` : prodAdv < -5 ? `${(totalRecvProd-totalGiveProd).toFixed(1)} pts/gm net loss` : "Production roughly even"}
+          </div>
+
+          {/* Per-player production */}
+          <div className="mt-4 space-y-1.5">
+            {[...givePlayers.map(p=>({...p,side:"give"})), ...recvPlayers.map(p=>({...p,side:"recv"}))].sort((a,b)=>(b.fpAvg||0)-(a.fpAvg||0)).map(p => (
+              <div key={p.id} className="flex items-center gap-2 text-xs">
+                <span className={`w-2 h-2 rounded-full shrink-0 ${p.side==="recv"?"bg-blue-400":"bg-gray-300"}`}/>
+                <span className="text-gray-600 flex-1 truncate">{p.name}</span>
+                <span className={`font-bold ${p.side==="recv"?"text-blue-600":"text-gray-500"}`}>{(p.fpAvg||0).toFixed(1)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Position & Category Impact */}
+        <div className="bg-white rounded-xl shadow p-5">
+          <div className="flex items-center gap-2 mb-4">
+            <span className="text-base">🎯</span>
+            <div>
+              <div className="font-black text-sm text-gray-800">Roster Impact</div>
+              <div className="text-xs text-gray-400">Positions · categories · 15% of score</div>
+            </div>
+          </div>
+
+          {/* Position impact */}
+          <div className="mb-4">
+            <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Position Impact</div>
+            {!roster ? (
+              <p className="text-xs text-gray-400 italic">Import your roster CSV to see positional impact.</p>
+            ) : positionNeeds.length === 0 ? (
+              <p className="text-xs text-green-600">✅ No critical positional needs on your roster.</p>
+            ) : (
+              <div className="space-y-1.5">
+                {positionNeeds.map(n => {
+                  const filled   = recvPlayers.some(p => p.type===n.type && eligibleFor(p,n.pos));
+                  const vacated  = givePlayers.some(p => p.type===n.type && eligibleFor(p,n.pos));
+                  const neutral  = !filled && !vacated;
+                  return (
+                    <div key={n.pos} className={`flex items-center gap-2 text-xs rounded-lg px-2.5 py-1.5 ${filled&&!vacated?"bg-green-100 text-green-700":vacated&&!filled?"bg-red-100 text-red-700":"bg-gray-50 text-gray-500"}`}>
+                      <span className={`font-bold px-1.5 py-0.5 rounded-full ${posColor(n.pos)}`}>{n.pos}</span>
+                      <span className="font-medium flex-1">{n.label}</span>
+                      <span className="font-bold">{filled&&!vacated?"✓ Filled":vacated&&!filled?"✗ Vacated":"—"}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* Category impact */}
+          <div>
+            <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Category Changes</div>
+            {!hasCatData ? (
+              <p className="text-xs text-gray-400 italic">Add players via live MLB directory to see stat-level category impact.</p>
+            ) : (
+              <div className="flex flex-wrap gap-2">
+                <DeltaChip label="HR"  val={catDelta.hr}  icon="💥"/>
+                <DeltaChip label="SB"  val={catDelta.sb}  icon="⚡"/>
+                <DeltaChip label="RBI" val={catDelta.rbi} icon="🏠"/>
+                <DeltaChip label="K"   val={catDelta.k}   icon="🔥"/>
+                <DeltaChip label="SV"  val={catDelta.sv}  icon="🔒"/>
+                <DeltaChip label="QS"  val={catDelta.qs}  icon="🎯"/>
+                {Object.values(catDelta).every(v => v === 0) && (
+                  <p className="text-xs text-gray-400 italic">No stat changes detected.</p>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+
+      </div>
+    </div>
+  );
+}
+
+/* ── Trade Tab ─────────────────────────────────────────────────*/
+function TradeTab({ roster, league }) {
+  const [givePlayers, setGivePlayers] = useState([]);
+  const [recvPlayers, setRecvPlayers] = useState([]);
+  const [mlbDir,      setMlbDir]      = useState([]);
+  const [dirLoading,  setDirLoading]  = useState(false);
+  const [dirLoaded,   setDirLoaded]   = useState(false);
+  const [dirError,    setDirError]    = useState(null);
+
+  const { positionNeeds, categoryNeeds } = useMemo(() =>
+    roster ? analyzeNeeds(roster) : { positionNeeds:[], categoryNeeds:[] },
+  [roster]);
+
+  const giveNames = useMemo(() => new Set(givePlayers.map(p => p.name)), [givePlayers]);
+  const recvNames = useMemo(() => new Set(recvPlayers.map(p => p.name)), [recvPlayers]);
+  // Exclude players already on either side from searches
+  const allTradeNames = useMemo(() => new Set([...giveNames, ...recvNames]), [giveNames, recvNames]);
+
+  const addGive   = (p) => setGivePlayers(prev => prev.some(x=>x.name===p.name) ? prev : [p,...prev]);
+  const addRecv   = (p) => setRecvPlayers(prev => prev.some(x=>x.name===p.name) ? prev : [p,...prev]);
+  const removeGive = (id) => setGivePlayers(p => p.filter(x=>x.id!==id));
+  const removeRecv = (id) => setRecvPlayers(p => p.filter(x=>x.id!==id));
+
+  const loadDirectory = async () => {
+    setDirLoading(true); setDirError(null);
+    try {
+      const players = await fetchMLBDirectory();
+      setMlbDir(players);
+      setDirLoaded(true);
+    } catch(e) {
+      setDirError("Could not reach MLB Stats API. Check your connection and try again.");
+    } finally {
+      setDirLoading(false);
+    }
+  };
+
+  // Also allow adding from current roster
+  const rosterDir = useMemo(() => {
+    if (!roster) return [];
+    return roster.all.map(p => ({
+      ...p,
+      id: `roster-${p.id}`,
+      mlbId: p.id,
+      eligible: p.eligible || p.pos,
+    }));
+  }, [roster]);
+
+  const fullDir = useMemo(() => {
+    const combined = [...mlbDir, ...rosterDir.filter(r => !mlbDir.some(m => m.name === r.name))];
+    return combined;
+  }, [mlbDir, rosterDir]);
+
+  const canAnalyze = givePlayers.length > 0 && recvPlayers.length > 0;
+
+  // Totals for side-by-side summary
+  const giveTotal = givePlayers.reduce((s,p) => s+(p.fpAvg||0), 0);
+  const recvTotal = recvPlayers.reduce((s,p) => s+(p.fpAvg||0), 0);
+  const giveDsTotal = givePlayers.reduce((s,p) => s+dynastyScore(p), 0);
+  const recvDsTotal = recvPlayers.reduce((s,p) => s+dynastyScore(p), 0);
+
+  return (
+    <div className="space-y-5">
+
+      {/* Directory loader */}
+      {!dirLoaded && (
+        <div className="bg-blue-50 border-2 border-dashed border-blue-200 rounded-xl p-5 flex items-center justify-between gap-4 flex-wrap">
+          <div>
+            <h3 className="font-bold text-gray-800 text-sm">🌐 Load Player Directory for Trade Search</h3>
+            <p className="text-xs text-gray-500 mt-0.5">
+              Pulls live MLB + AAA stats so you can search any player by name on either side of the trade.
+              {roster && " Your current roster players are already available without loading."}
+            </p>
+            {dirError && <p className="text-xs text-red-600 mt-1">⚠ {dirError}</p>}
+          </div>
+          <div className="flex gap-3 flex-wrap">
+            <button onClick={loadDirectory} disabled={dirLoading}
+              className={`text-sm font-semibold px-5 py-2 rounded-lg transition-colors shrink-0 ${dirLoading?"bg-gray-300 text-gray-500 cursor-not-allowed":"bg-blue-600 hover:bg-blue-700 text-white"}`}>
+              {dirLoading ? "⏳ Loading…" : "⬇ Load Players"}
+            </button>
+            {roster && !dirLoaded && (
+              <p className="text-xs text-green-700 bg-green-50 border border-green-200 rounded-lg px-3 py-2 self-center">
+                ✓ Your {roster.all.length} roster players are searchable now
+              </p>
+            )}
+          </div>
+        </div>
+      )}
+      {dirLoaded && (
+        <div className="bg-green-50 border border-green-200 rounded-xl px-4 py-2.5 flex items-center justify-between">
+          <p className="text-xs text-green-700 font-semibold">✓ Directory loaded — {mlbDir.length.toLocaleString()} MLB + AAA players searchable</p>
+          <button onClick={loadDirectory} disabled={dirLoading} className="text-xs text-green-600 hover:underline">{dirLoading?"Refreshing…":"Refresh"}</button>
+        </div>
+      )}
+
+      {/* ── Trade Builder ── */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+
+        {/* YOU GIVE */}
+        <div className="bg-slate-50 rounded-2xl border-2 border-slate-200 p-5">
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-2">
+              <span className="text-lg">📤</span>
+              <div>
+                <h3 className="font-black text-sm text-slate-800">You Give</h3>
+                <p className="text-xs text-slate-400">{givePlayers.length} player{givePlayers.length!==1?"s":""}</p>
+              </div>
+            </div>
+            {givePlayers.length > 0 && (
+              <div className="text-right text-xs">
+                <div className="text-slate-400">Total</div>
+                <div className="font-black text-slate-700">{giveTotal.toFixed(1)} pts/gm</div>
+                <div className="text-slate-400">Dyn: {giveDsTotal}</div>
+              </div>
+            )}
+          </div>
+          <div className="mb-3">
+            <TradeSearch
+              dir={fullDir}
+              excludedNames={allTradeNames}
+              onAdd={addGive}
+              placeholder={fullDir.length ? "Search player to trade away…" : "Load directory above to search…"}/>
+          </div>
+          {givePlayers.length === 0 ? (
+            <div className="text-center py-8 border-2 border-dashed border-slate-200 rounded-xl">
+              <p className="text-xs text-slate-400">Search and add players you're trading away</p>
+            </div>
+          ) : (
+            <div className="space-y-2.5">
+              {givePlayers.map(p => <TradePlayerCard key={p.id} player={p} onRemove={()=>removeGive(p.id)}/>)}
+            </div>
+          )}
+        </div>
+
+        {/* YOU RECEIVE */}
+        <div className="bg-blue-50 rounded-2xl border-2 border-blue-200 p-5">
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-2">
+              <span className="text-lg">📥</span>
+              <div>
+                <h3 className="font-black text-sm text-blue-800">You Receive</h3>
+                <p className="text-xs text-blue-400">{recvPlayers.length} player{recvPlayers.length!==1?"s":""}</p>
+              </div>
+            </div>
+            {recvPlayers.length > 0 && (
+              <div className="text-right text-xs">
+                <div className="text-blue-400">Total</div>
+                <div className="font-black text-blue-700">{recvTotal.toFixed(1)} pts/gm</div>
+                <div className="text-blue-400">Dyn: {recvDsTotal}</div>
+              </div>
+            )}
+          </div>
+          <div className="mb-3">
+            <TradeSearch
+              dir={fullDir}
+              excludedNames={allTradeNames}
+              onAdd={addRecv}
+              placeholder={fullDir.length ? "Search player to receive…" : "Load directory above to search…"}/>
+          </div>
+          {recvPlayers.length === 0 ? (
+            <div className="text-center py-8 border-2 border-dashed border-blue-200 rounded-xl">
+              <p className="text-xs text-blue-400">Search and add players you're receiving</p>
+            </div>
+          ) : (
+            <div className="space-y-2.5">
+              {recvPlayers.map(p => <TradePlayerCard key={p.id} player={p} onRemove={()=>removeRecv(p.id)}/>)}
+            </div>
+          )}
+        </div>
+
+      </div>
+
+      {/* Reset */}
+      {(givePlayers.length > 0 || recvPlayers.length > 0) && (
+        <div className="flex justify-end">
+          <button onClick={() => { setGivePlayers([]); setRecvPlayers([]); }}
+            className="text-xs text-gray-400 hover:text-red-400 transition-colors">
+            ✕ Reset trade
+          </button>
+        </div>
+      )}
+
+      {/* ── Analysis ── */}
+      {canAnalyze ? (
+        <div>
+          <div className="flex items-center gap-2 mb-3">
+            <h3 className="font-bold text-gray-800 text-sm">⚖️ Trade Analysis</h3>
+            <span className="text-xs text-gray-400">Dynasty weights: Dynasty 45% · Production 40% · Position 15%</span>
+          </div>
+          <TradeAnalysisPanel
+            givePlayers={givePlayers}
+            recvPlayers={recvPlayers}
+            roster={roster}
+            positionNeeds={positionNeeds}
+            categoryNeeds={categoryNeeds}
+          />
+        </div>
+      ) : (
+        givePlayers.length > 0 || recvPlayers.length > 0 ? (
+          <div className="bg-white rounded-xl shadow p-8 text-center border-2 border-dashed border-gray-200">
+            <div className="text-3xl mb-2">⚖️</div>
+            <p className="text-gray-500 text-sm font-semibold">Add players to both sides to see the analysis</p>
+            <p className="text-gray-400 text-xs mt-1">You need at least one player on each side</p>
+          </div>
+        ) : null
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   ROOT APP
+   ═══════════════════════════════════════════════════════════════ */
+function App() {
+  const [roster,       setRoster]       = useState(null);
+  const [tab,          setTab]          = useState("fa");
+  const [dragOver,     setDragOver]     = useState(false);
+  const [error,        setError]        = useState(null);
+  const [rosterFilter, setRosterFilter] = useState("all");
+  const [showSettings, setShowSettings] = useState(false);
+  const [league,       setLeague]       = useState(DEFAULT_LEAGUE);
+  const [filename,     setFilename]     = useState(null);
+  const [importDate,   setImportDate]   = useState(null);
+  const fileRef = useRef();
+
+  const handleFile = useCallback((file) => {
+    if (!file) return;
+    if (!file.name.endsWith(".csv")) { setError("Please upload a Fantrax Team Roster .csv file."); return; }
+    const reader = new FileReader();
+    reader.onload = e => {
+      try {
+        const parsed = parseFantraxCSV(e.target.result);
+        if (parsed.all.length===0) throw new Error(`No players found (${parsed.hitters.length} hitters, ${parsed.pitchers.length} pitchers detected). Make sure you're using a Fantrax Team Roster CSV export — go to My Team → Roster, scroll to the bottom, and click Export → CSV.`);
+        setRoster(parsed);
+        setFilename(file.name);
+        setImportDate(new Date().toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}));
+        setError(null); setTab("suggestions");
+      } catch(err) { setError(err.message); }
+    };
+    reader.readAsText(file);
+  }, []);
+
+  const onDrop = useCallback((e)=>{e.preventDefault();setDragOver(false);handleFile(e.dataTransfer.files[0]);},[handleFile]);
+
+  const suggestions = useMemo(()=>roster?generateSuggestions(roster.hitters,roster.pitchers):[],[roster]);
+
+  const counts = useMemo(()=>{
+    if (!roster) return {};
+    const a=roster.all;
+    return { total:a.length, active:a.filter(p=>p.status==="Act").length, reserve:a.filter(p=>p.status==="Res").length, ir:a.filter(p=>p.status==="IR").length, minors:a.filter(p=>p.status==="Min").length,
+      critical:suggestions.filter(s=>s.priority==="critical").length, high:suggestions.filter(s=>s.priority==="high").length };
+  },[roster,suggestions]);
+
+  /* ── DASHBOARD ── */
+  const activeH = roster ? roster.all.filter(p=>p.status==="Act"&&p.type==="hitter") : [];
+  const activeP = roster ? roster.all.filter(p=>p.status==="Act"&&p.type==="pitcher") : [];
+  const filteredRoster = roster ? (rosterFilter==="all"?roster.all:roster.all.filter(p=>p.status===rosterFilter)) : [];
+  const { positionNeeds } = roster ? analyzeNeeds(roster) : { positionNeeds: [] };
+  const needCount = positionNeeds.filter(n=>n.severity==="critical").length;
+
+  return (
+    <div className="min-h-screen bg-slate-50 text-sm">
+      {showSettings && <SettingsPanel league={league} onChange={setLeague} onClose={()=>setShowSettings(false)}/>}
+
+      {/* Header */}
+      <div className="bg-gradient-to-r from-slate-900 to-blue-900 text-white px-5 py-4 shadow-lg">
+        <div className="max-w-6xl mx-auto flex items-center justify-between flex-wrap gap-3">
+          <div className="flex items-center gap-3">
+            <span className="text-2xl">⚾</span>
+            <div>
+              <h1 className="text-base font-black">{league.name}</h1>
+              <p className="text-blue-300 text-xs">{league.scoring} · {league.platform}</p>
+              {filename && <p className="text-slate-400 text-xs mt-0.5">📄 {filename} · {importDate}</p>}
+            </div>
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            {(counts.critical>0||counts.high>0) && (
+              <span className="bg-red-500/20 border border-red-500/40 text-red-300 text-xs font-semibold px-3 py-1.5 rounded-lg">⚠ {counts.critical} critical · {counts.high} high</span>
+            )}
+            {needCount > 0 && (
+              <span className="bg-orange-500/20 border border-orange-500/40 text-orange-300 text-xs font-semibold px-3 py-1.5 rounded-lg cursor-pointer" onClick={()=>setTab("fa")}>🔍 {needCount} position need{needCount!==1?"s":""}</span>
+            )}
+            <div className="text-right text-xs">
+              <div className="text-slate-400">FAAB</div>
+              <div className="text-white font-bold">${league.remainingFaab.toLocaleString()}</div>
+            </div>
+            <button onClick={()=>fileRef.current?.click()} className="bg-white/10 hover:bg-white/20 border border-white/20 text-white text-xs px-3 py-2 rounded-lg">{roster ? "↑ New CSV" : "↑ Import Roster CSV"}</button>
+            <button onClick={()=>setShowSettings(true)} className="bg-white/10 hover:bg-white/20 border border-white/20 text-white text-xs px-3 py-2 rounded-lg">⚙</button>
+            <input ref={fileRef} type="file" accept=".csv" className="hidden" onChange={e=>handleFile(e.target.files[0])}/>
+          </div>
+        </div>
+      </div>
+
+      {/* Tabs */}
+      <div className="bg-white border-b shadow-sm sticky top-0 z-10">
+        <div className="max-w-6xl mx-auto px-5 flex overflow-x-auto">
+          {[
+            ["suggestions", roster ? `🎯 Moves (${suggestions.length})` : "🎯 Moves"],
+            ["active",      roster ? `🟢 Active (${counts.active})`    : "🟢 Active"],
+            ["roster",      roster ? `👥 Roster (${counts.total})`     : "👥 Roster"],
+            ["fa",          "🔍 FA Analyzer"],
+            ["trade",       "⚖️ Trade"],
+          ].map(([id,label])=>(
+            <button key={id} onClick={()=>setTab(id)}
+              className={`px-5 py-3 font-medium border-b-2 whitespace-nowrap text-xs transition-colors ${tab===id?"border-blue-600 text-blue-700":"border-transparent text-gray-500 hover:text-gray-700"}`}>
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* CSV Upload Banner (shown when no roster loaded) */}
+      {!roster && (
+        <div className="bg-blue-50 border-b border-blue-200">
+          <div className="max-w-6xl mx-auto px-5 py-3 flex items-center gap-4 flex-wrap">
+            <div onDragOver={e=>{e.preventDefault();setDragOver(true)}} onDragLeave={()=>setDragOver(false)} onDrop={onDrop}
+              onClick={()=>fileRef.current?.click()}
+              className={`flex items-center gap-3 border-2 border-dashed rounded-xl px-5 py-2.5 cursor-pointer transition-all flex-1 min-w-[260px] ${dragOver?"border-blue-500 bg-blue-100":"border-blue-300 hover:border-blue-500 hover:bg-blue-100"}`}>
+              <span className="text-2xl">{dragOver?"📂":"📁"}</span>
+              <div>
+                <p className="text-blue-800 font-semibold text-sm">Drop your Fantrax Team Roster CSV here</p>
+                <p className="text-blue-500 text-xs">or click to browse — enables Moves, Active & Roster tabs</p>
+              </div>
+            </div>
+            <div className="text-xs text-blue-600 leading-relaxed hidden sm:block">
+              <p>In Fantrax: <strong>My Team → Roster</strong></p>
+              <p>Scroll to bottom → <strong>Export → CSV</strong></p>
+            </div>
+            {error && <div className="bg-red-100 border border-red-300 text-red-700 rounded-lg px-4 py-2 text-xs">⚠ {error}</div>}
+          </div>
+        </div>
+      )}
+
+      <div className="max-w-6xl mx-auto px-5 py-6">
+
+        {tab==="suggestions" && !roster && (
+          <div className="flex flex-col items-center justify-center py-24 text-center">
+            <div className="text-5xl mb-4">📁</div>
+            <h2 className="text-xl font-bold text-gray-700 mb-2">Upload your roster to see move suggestions</h2>
+            <p className="text-gray-400 text-sm max-w-sm">Use the bar above to import your Fantrax Team Roster CSV. The 🔍 FA Analyzer tab works right now without any upload.</p>
+            <button onClick={()=>setTab("fa")} className="mt-6 bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold px-6 py-2.5 rounded-xl transition-colors">Go to FA Analyzer →</button>
+          </div>
+        )}
+
+        {tab==="suggestions" && roster && (
+          <div>
+            <div className="grid grid-cols-3 gap-4 mb-6">
+              {[
+                {label:"Critical moves",count:suggestions.filter(s=>s.priority==="critical").length,bar:"bg-red-500"},
+                {label:"High priority", count:suggestions.filter(s=>s.priority==="high").length,    bar:"bg-orange-400"},
+                {label:"Worth noting",  count:suggestions.filter(s=>["medium","low"].includes(s.priority)).length, bar:"bg-yellow-400"},
+              ].map(({label,count,bar})=>(
+                <div key={label} className="bg-white rounded-xl border shadow-sm p-4 text-center">
+                  <div className={`text-3xl font-black ${count>0?"text-gray-800":"text-gray-300"}`}>{count}</div>
+                  <div className="text-xs text-gray-500 mt-1">{label}</div>
+                  {count>0&&<div className={`mt-2 h-1 rounded-full ${bar}`}/>}
+                </div>
+              ))}
+            </div>
+            {suggestions.length===0
+              ? <div className="bg-green-50 border border-green-200 rounded-xl p-10 text-center"><div className="text-4xl mb-2">✅</div><p className="font-semibold text-green-800">Roster looks clean — no obvious moves this week.</p></div>
+              : <div className="space-y-3">{suggestions.map(s=><SuggestionCard key={s.id} s={s}/>)}</div>
+            }
+            <div className="mt-6 bg-slate-800 text-white rounded-xl p-5">
+              <h3 className="font-bold text-xs mb-3 uppercase tracking-wide">Week Limits</h3>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs text-slate-300">
+                <div><span className="text-white font-semibold">Max Starts:</span> {league.maxStarts}/week</div>
+                <div><span className="text-white font-semibold">Max Saves:</span> {league.maxSaves}/week</div>
+                <div><span className="text-white font-semibold">Lineup Lock:</span> Monday</div>
+                <div><span className="text-white font-semibold">FAAB Left:</span> ${league.remainingFaab.toLocaleString()}</div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {tab==="active" && !roster && (
+          <div className="flex flex-col items-center justify-center py-24 text-center">
+            <div className="text-5xl mb-4">🟢</div>
+            <h2 className="text-xl font-bold text-gray-700 mb-2">Upload your roster to see your active lineup</h2>
+            <p className="text-gray-400 text-sm max-w-sm">Use the bar above to import your Fantrax Team Roster CSV.</p>
+          </div>
+        )}
+
+        {tab==="active" && roster && (
+          <div>
+            <ActiveGroup title="⚡ Hitters"  players={activeH} type="hitter"  accentClass="text-amber-700 bg-amber-50 border-amber-100"/>
+            <ActiveGroup title="🔵 Pitchers" players={activeP} type="pitcher" accentClass="text-indigo-700 bg-indigo-50 border-indigo-100"/>
+          </div>
+        )}
+
+        {tab==="roster" && !roster && (
+          <div className="flex flex-col items-center justify-center py-24 text-center">
+            <div className="text-5xl mb-4">👥</div>
+            <h2 className="text-xl font-bold text-gray-700 mb-2">Upload your roster to view all players</h2>
+            <p className="text-gray-400 text-sm max-w-sm">Use the bar above to import your Fantrax Team Roster CSV.</p>
+          </div>
+        )}
+
+        {tab==="roster" && roster && (
+          <div>
+            <div className="flex gap-2 mb-4 flex-wrap">
+              {[["all",`All (${counts.total})`],["Act",`Active (${counts.active})`],["Res",`Reserve (${counts.reserve})`],["IR",`IR (${counts.ir})`],["Min",`Minors (${counts.minors})`]].map(([key,label])=>(
+                <button key={key} onClick={()=>setRosterFilter(key)}
+                  className={`px-4 py-1.5 rounded-full text-xs font-medium transition-colors ${rosterFilter===key?"bg-blue-600 text-white":"bg-white border border-gray-200 text-gray-600 hover:bg-gray-50"}`}>
+                  {label}
+                </button>
+              ))}
+            </div>
+            <RosterTable players={filteredRoster} filter={rosterFilter}/>
+          </div>
+        )}
+
+        {tab==="fa" && (
+          <FaAnalyzerTab
+            roster={roster}
+            league={league}
+            onFaabChange={v=>setLeague(l=>({...l,remainingFaab:v}))}
+          />
+        )}
+
+        {tab==="trade" && (
+          <TradeTab
+            roster={roster}
+            league={league}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App/>);
+</script>
+</body>
+</html>
