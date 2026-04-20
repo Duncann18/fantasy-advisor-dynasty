@@ -882,6 +882,393 @@ async function fetchMLBDirectory() {
   });
 }
 
+/* ═══════════════════════════════════════════════════════════════
+   LIVE PLAYER NEWS  (MLB Transactions + RSS Sources)
+   ═══════════════════════════════════════════════════════════════ */
+
+// Transaction type metadata
+var TX_META = {
+  "IL":  { label: "Placed on IL",          emoji: "🚑", severity: "critical",  color: "bg-red-50 border-red-200",    text: "text-red-800"    },
+  "RH":  { label: "Reinstated from IL",    emoji: "✅", severity: "positive",  color: "bg-green-50 border-green-200", text: "text-green-800"  },
+  "RL":  { label: "Recalled",              emoji: "⬆️", severity: "info",      color: "bg-blue-50 border-blue-200",   text: "text-blue-800"   },
+  "OU":  { label: "Optioned to Minors",    emoji: "⬇️", severity: "warning",   color: "bg-yellow-50 border-yellow-200","text": "text-yellow-800"},
+  "DFA": { label: "Designated for Assign.",emoji: "📋", severity: "warning",   color: "bg-orange-50 border-orange-200","text":"text-orange-800"},
+  "SA":  { label: "Selected to Roster",    emoji: "🆙", severity: "info",      color: "bg-blue-50 border-blue-200",   text: "text-blue-800"   },
+  "TR":  { label: "Traded",               emoji: "🔄", severity: "info",      color: "bg-purple-50 border-purple-200",text:"text-purple-800" },
+  "RE":  { label: "Released",             emoji: "📤", severity: "warning",   color: "bg-orange-50 border-orange-200","text":"text-orange-800"},
+  "SE":  { label: "Signed",              emoji: "📝", severity: "info",      color: "bg-blue-50 border-blue-200",   text: "text-blue-800"   },
+  "SB":  { label: "Bereavement/Paternity",emoji: "🏠", severity: "warning",   color: "bg-yellow-50 border-yellow-200","text":"text-yellow-800"},
+  "RB":  { label: "Reinstated (Bereav.)", emoji: "✅", severity: "positive",  color: "bg-green-50 border-green-200", text: "text-green-800"  },
+  "news":{ label: "News",                emoji: "📰", severity: "info",      color: "bg-gray-50 border-gray-200",   text: "text-gray-700"   },
+};
+
+function getTxMeta(code) {
+  return TX_META[code] || { label: code || "Update", emoji: "📋", severity: "info", color: "bg-gray-50 border-gray-200", text: "text-gray-700" };
+}
+
+function getTxAction(typeCode, playerPos) {
+  if (typeCode === "IL")  return "Find a " + (playerPos || "position") + " replacement in FA";
+  if (typeCode === "RH")  return "Activate from IL to your active roster";
+  if (typeCode === "DFA") return "Player may be available as FA soon — check waivers";
+  if (typeCode === "RL")  return "Prospect called up — consider stash or add";
+  if (typeCode === "TR")  return "Team change — verify fantasy eligibility & role";
+  return null;
+}
+
+function fmtNewsDate(d) {
+  if (!d) return "";
+  try {
+    return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  } catch(e) { return ""; }
+}
+
+// RSS-to-JSON proxy (free, no key needed, handles CORS for any RSS feed)
+var RSS2JSON = "https://api.rss2json.com/v1/api.json?rss_url=";
+
+// Fantasy-relevant RSS feeds — each filtered to your roster players
+var RSS_SOURCES = [
+  { name: "Rotowire",        url: "https://www.rotowire.com/baseball/rss-player-news.php",  fantasy: true  },
+  { name: "MLB.com",         url: "https://www.mlb.com/feeds/news/rss.xml",                 fantasy: false },
+  { name: "CBS Sports",      url: "https://www.cbssports.com/rss/headlines/mlb/",           fantasy: false },
+  { name: "Yahoo Sports",    url: "https://sports.yahoo.com/mlb/rss.xml",                  fantasy: false },
+  { name: "Bleacher Report", url: "https://bleacherreport.com/mlb.rss",                    fantasy: false },
+  { name: "NBC Sports",      url: "https://mlb.nbcsports.com/feed/",                       fantasy: false },
+  { name: "FanGraphs",       url: "https://blogs.fangraphs.com/feed/",                     fantasy: true  },
+];
+
+var INJURY_REGEX = /injur|injured|il |i\.l\.|disabled list|strain|sprain|surgery|rehab|day-to-day|d-t-d|dtd|hamstring|oblique|concussion|fracture|soreness|inflammation|elbow|shoulder|wrist|back pain|placed on/i;
+var RETURN_REGEX  = /reinstated|activated|returns from|cleared|off the il|off il/i;
+var CALL_UP_REGEX = /recalled|called up|promoted|selected/i;
+
+async function fetchPlayerNews(rosterPlayers) {
+  var now   = new Date();
+  var start = new Date(now.getTime() - 21 * 24 * 60 * 60 * 1000);
+
+  function pad(n) { return String(n).padStart(2, "0"); }
+  function isoDate(d) { return d.getFullYear() + "-" + pad(d.getMonth()+1) + "-" + pad(d.getDate()); }
+
+  // Build name→player lookup (lowercase keys)
+  var rosterMap = {};
+  for (var i = 0; i < rosterPlayers.length; i++) {
+    rosterMap[rosterPlayers[i].name.toLowerCase()] = rosterPlayers[i];
+  }
+  var rNames = Object.keys(rosterMap);
+
+  var newsItems = [];
+  var seenKeys  = {};
+
+  function addItem(item) {
+    if (!item || !item.playerName) return;
+    var key = item.playerName + "|" + item.source + "|" + item.headline.slice(0, 40);
+    if (seenKeys[key]) return;
+    seenKeys[key] = true;
+    newsItems.push(item);
+  }
+
+  function findPlayer(text) {
+    var t = text.toLowerCase();
+    for (var r = 0; r < rNames.length; r++) {
+      if (t.indexOf(rNames[r]) >= 0) return rosterMap[rNames[r]];
+    }
+    return null;
+  }
+
+  function classifyText(text) {
+    if (INJURY_REGEX.test(text))  return { typeCode: "IL",   severity: "critical" };
+    if (RETURN_REGEX.test(text))  return { typeCode: "RH",   severity: "positive" };
+    if (CALL_UP_REGEX.test(text)) return { typeCode: "RL",   severity: "info"     };
+    return                               { typeCode: "news", severity: "info"     };
+  }
+
+  // ── 1. MLB Official Transactions (authoritative) ──────────────
+  try {
+    var txUrl  = MLB_API + "/transactions?startDate=" + isoDate(start) + "&endDate=" + isoDate(now) + "&sportId=1&limit=500";
+    var txResp = await fetch(txUrl);
+    if (txResp.ok) {
+      var txList = (await txResp.json()).transactions || [];
+      for (var t = 0; t < txList.length; t++) {
+        var tx    = txList[t];
+        var pName = tx.player && tx.player.fullName ? tx.player.fullName : null;
+        if (!pName) continue;
+        var rp = rosterMap[pName.toLowerCase()];
+        if (!rp) continue;
+        var typeCode = tx.typeCode || tx.typeCd || "?";
+        var txDate   = tx.effectiveDate ? new Date(tx.effectiveDate) : (tx.date ? new Date(tx.date) : now);
+        var meta     = getTxMeta(typeCode);
+        addItem({
+          id: "tx-" + (tx.id || Math.random()),
+          date: txDate, playerName: pName, playerPos: rp.pos || "",
+          typeCode: typeCode, source: "MLB Official",
+          headline: meta.label + ": " + pName,
+          detail:   tx.description || tx.notes || meta.label + " transaction",
+          severity: meta.severity,
+          action:   getTxAction(typeCode, rp.pos),
+        });
+      }
+    }
+  } catch(e) {}
+
+  // ── 2. ESPN Direct API ────────────────────────────────────────
+  try {
+    var espnResp = await fetch("https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/news?limit=100");
+    if (espnResp.ok) {
+      var articles = (await espnResp.json()).articles || [];
+      for (var a = 0; a < articles.length; a++) {
+        var art  = articles[a];
+        var hl   = art.headline || "";
+        var desc = art.description || "";
+        var rp2  = findPlayer(hl + " " + desc);
+        if (!rp2) continue;
+        var pubDate = art.published ? new Date(art.published) : now;
+        if (now - pubDate > 21 * 24 * 60 * 60 * 1000) continue;
+        var cls = classifyText(hl + " " + desc);
+        var espnLink = (art.links && art.links.web && art.links.web.href) ? art.links.web.href : (art.url || null);
+        addItem({
+          id: "espn-" + (art.dataSourceIdentifier || Math.random()),
+          date: pubDate, playerName: rp2.name, playerPos: rp2.pos || "",
+          typeCode: cls.typeCode, source: "ESPN",
+          headline: hl, detail: desc, link: espnLink,
+          severity: cls.severity,
+          action: cls.typeCode !== "news" ? getTxAction(cls.typeCode, rp2.pos) : null,
+        });
+      }
+    }
+  } catch(e) {}
+
+  // ── 3. RSS Sources via rss2json ───────────────────────────────
+  var rssPromises = RSS_SOURCES.map(function(src) {
+    return fetch(RSS2JSON + encodeURIComponent(src.url) + "&count=100")
+      .then(function(r) { return r.ok ? r.json() : { items: [] }; })
+      .catch(function()  { return { items: [] }; })
+      .then(function(data) { return { src: src, items: data.items || [] }; });
+  });
+
+  var rssResults = await Promise.all(rssPromises);
+
+  for (var ri = 0; ri < rssResults.length; ri++) {
+    var src   = rssResults[ri].src;
+    var items = rssResults[ri].items;
+    for (var ii = 0; ii < items.length; ii++) {
+      var item    = items[ii];
+      var title   = item.title || "";
+      var content = item.description || item.content || "";
+      var rp3     = findPlayer(title + " " + content);
+      if (!rp3) continue;
+
+      var itemDate = item.pubDate ? new Date(item.pubDate) : now;
+      if (isNaN(itemDate.getTime())) itemDate = now;
+      if (now - itemDate > 21 * 24 * 60 * 60 * 1000) continue;
+
+      // Strip HTML tags from content for display
+      var cleanContent = content.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 300);
+      var cls2 = classifyText(title + " " + content);
+
+      addItem({
+        id: src.name.toLowerCase() + "-" + (item.guid || item.link || Math.random()),
+        date: itemDate, playerName: rp3.name, playerPos: rp3.pos || "",
+        typeCode: cls2.typeCode, source: src.name,
+        headline: title.replace(/<[^>]+>/g, "").trim(),
+        detail:   cleanContent,
+        link:     item.link || null,
+        severity: cls2.severity,
+        action:   cls2.typeCode !== "news" ? getTxAction(cls2.typeCode, rp3.pos) : null,
+      });
+    }
+  }
+
+  // Sort: critical first, then by date descending
+  newsItems.sort(function(a, b) {
+    var order = { critical: 0, warning: 1, positive: 2, info: 3 };
+    var sa = order[a.severity] !== undefined ? order[a.severity] : 9;
+    var sb = order[b.severity] !== undefined ? order[b.severity] : 9;
+    if (sa !== sb) return sa - sb;
+    return b.date - a.date;
+  });
+
+  return newsItems;
+}
+
+function sourceColor(source) {
+  if (source === "Rotowire")        return "bg-emerald-100 text-emerald-800";
+  if (source === "ESPN")            return "bg-red-100 text-red-700";
+  if (source === "MLB Official")    return "bg-blue-100 text-blue-800";
+  if (source === "CBS Sports")      return "bg-yellow-100 text-yellow-800";
+  if (source === "Yahoo Sports")    return "bg-purple-100 text-purple-800";
+  if (source === "Bleacher Report") return "bg-orange-100 text-orange-800";
+  if (source === "NBC Sports")      return "bg-sky-100 text-sky-800";
+  if (source === "FanGraphs")       return "bg-teal-100 text-teal-800";
+  return "bg-gray-100 text-gray-700";
+}
+
+/* ── Highlight player name inside a text string ────────────────*/
+function HighlightedText({ text, name }) {
+  if (!text || !name) return <span>{text}</span>;
+  var escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  var parts = text.split(new RegExp("(" + escapedName + ")", "gi"));
+  return (
+    <span>
+      {parts.map(function(part, i) {
+        var isMatch = part.toLowerCase() === name.toLowerCase();
+        return isMatch
+          ? <mark key={i} className="bg-yellow-200 text-yellow-900 font-bold rounded px-0.5 not-italic">{part}</mark>
+          : <span key={i}>{part}</span>;
+      })}
+    </span>
+  );
+}
+
+/* ── News Card (top-level, Babel-safe) ─────────────────────────*/
+function NewsCard({ item }) {
+  var meta = getTxMeta(item.typeCode);
+  var dateStr = fmtNewsDate(item.date);
+  var hasLink = item.link && item.link.length > 0;
+  return (
+    <div className={"rounded-xl border p-4 " + meta.color}>
+      <div className="flex items-start gap-2.5">
+        <span className="text-lg shrink-0 mt-0.5">{meta.emoji}</span>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2 flex-wrap mb-1">
+            <span className={"text-xs font-bold px-1.5 py-0.5 rounded-full " + posColor(item.playerPos || "OF")}>{item.playerPos || "—"}</span>
+            <span className={"font-bold text-sm " + meta.text}>{item.playerName}</span>
+            <span className={"text-xs px-2 py-0.5 rounded-full font-semibold border " + meta.color + " " + meta.text}>{meta.label}</span>
+            <span className={"text-xs px-2 py-0.5 rounded-full font-semibold " + sourceColor(item.source)}>{item.source}</span>
+            <span className="text-xs text-gray-400 ml-auto">{dateStr}</span>
+          </div>
+
+          {/* Headline — clickable if link exists */}
+          {hasLink ? (
+            <a
+              href={item.link}
+              target="_blank"
+              rel="noopener noreferrer"
+              className={"text-xs font-semibold leading-snug hover:underline flex items-start gap-1 group " + meta.text}
+            >
+              <span className="flex-1"><HighlightedText text={item.headline} name={item.playerName}/></span>
+              <span className="text-gray-400 group-hover:text-blue-500 shrink-0 mt-0.5" title="Open article">↗</span>
+            </a>
+          ) : (
+            <p className="text-xs font-semibold text-gray-700 leading-snug">
+              <HighlightedText text={item.headline} name={item.playerName}/>
+            </p>
+          )}
+
+          {/* Description with player name highlighted */}
+          {item.detail && item.detail !== item.headline && (
+            <p className="text-xs text-gray-500 mt-1 leading-snug">
+              <HighlightedText text={item.detail} name={item.playerName}/>
+            </p>
+          )}
+
+          {item.action && (
+            <p className={"text-xs font-semibold mt-2 " + meta.text}>→ {item.action}</p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── Full News Tab ─────────────────────────────────────────────*/
+function NewsTab({ roster, news, newsLoading, newsLoaded, newsError, onRefresh }) {
+  const [filter, setFilter] = useState("all");
+
+  var filtered = news;
+  if (filter === "injuries") {
+    filtered = news.filter(function(n) { return n.severity === "critical" || n.typeCode === "IL" || n.typeCode === "SB"; });
+  } else if (filter === "transactions") {
+    filtered = news.filter(function(n) { return n.typeCode !== "news" && n.source === "MLB Official"; });
+  }
+
+  var criticalCount = news.filter(function(n) { return n.severity === "critical"; }).length;
+
+  if (!roster) {
+    return (
+      <div className="flex flex-col items-center justify-center py-24 text-center">
+        <div className="text-5xl mb-4">📰</div>
+        <h3 className="font-bold text-gray-700 text-lg mb-2">No roster loaded</h3>
+        <p className="text-gray-400 text-sm max-w-xs">Upload your Fantrax roster CSV first — then we'll pull live news and injury updates for all your players.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-5">
+      {/* Header card */}
+      <div className="bg-white rounded-xl shadow p-5">
+        <div className="flex items-center justify-between flex-wrap gap-3">
+          <div>
+            <h3 className="font-bold text-gray-800">Player News Feed</h3>
+            <p className="text-xs text-gray-400 mt-0.5">Live updates from ESPN, Rotowire, MLB Official, CBS Sports, Yahoo Sports, Bleacher Report, NBC Sports & FanGraphs — filtered to your {roster.all.length} roster players.</p>
+          </div>
+          <div className="flex items-center gap-3">
+            {criticalCount > 0 && (
+              <span className="bg-red-100 text-red-700 text-xs font-bold px-3 py-1.5 rounded-full border border-red-200">
+                🚑 {criticalCount} injury alert{criticalCount !== 1 ? "s" : ""}
+              </span>
+            )}
+            <button
+              onClick={onRefresh}
+              disabled={newsLoading}
+              className={"text-sm font-semibold px-4 py-2 rounded-lg transition-colors " + (newsLoading ? "bg-gray-200 text-gray-400 cursor-not-allowed" : "bg-blue-600 hover:bg-blue-700 text-white")}
+            >
+              {newsLoading ? "Loading..." : newsLoaded ? "Refresh" : "Load News"}
+            </button>
+          </div>
+        </div>
+        {newsError && <p className="text-xs text-red-500 mt-2">{newsError}</p>}
+      </div>
+
+      {/* Filter pills */}
+      {newsLoaded && news.length > 0 && (
+        <div className="flex gap-2 flex-wrap">
+          {[["all","All"],["injuries","Injuries"],["transactions","Transactions"]].map(function(pair) {
+            return (
+              <button
+                key={pair[0]}
+                onClick={function() { setFilter(pair[0]); }}
+                className={"text-xs font-semibold px-3 py-1.5 rounded-full border transition-colors " + (filter === pair[0] ? "bg-blue-600 text-white border-blue-600" : "bg-white text-gray-600 border-gray-200 hover:border-gray-400")}
+              >
+                {pair[1]}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {/* News items */}
+      {!newsLoaded && !newsLoading && (
+        <div className="bg-white rounded-xl shadow p-8 text-center">
+          <div className="text-4xl mb-3">📡</div>
+          <p className="text-gray-500 text-sm font-medium">Click "Load News" to fetch live updates for your roster</p>
+          <p className="text-gray-400 text-xs mt-1">Pulls from MLB Official transactions, ESPN, Rotowire, CBS Sports, Yahoo Sports, Bleacher Report, NBC Sports & FanGraphs</p>
+        </div>
+      )}
+
+      {newsLoading && (
+        <div className="bg-white rounded-xl shadow p-8 text-center">
+          <div className="text-gray-400 text-sm animate-pulse">Checking 8 sources including ESPN, Rotowire, CBS Sports & more for your {roster.all.length} players...</div>
+        </div>
+      )}
+
+      {newsLoaded && filtered.length === 0 && (
+        <div className="bg-white rounded-xl shadow p-8 text-center">
+          <div className="text-3xl mb-2">✅</div>
+          <p className="text-gray-500 text-sm font-medium">No {filter !== "all" ? filter + " " : ""}news in the last 21 days</p>
+          <p className="text-gray-400 text-xs mt-1">All quiet — check back after the next game day.</p>
+        </div>
+      )}
+
+      {newsLoaded && filtered.length > 0 && (
+        <div className="space-y-3">
+          {filtered.map(function(item) {
+            return <NewsCard key={item.id} item={item} />;
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ── PLAYER SEARCH DROPDOWN ────────────────────────────────────*/
 function PlayerSearch({ dir, ownedNames, onSelect, onEvaluate }) {
   const [query,  setQuery]  = useState("");
@@ -1703,15 +2090,12 @@ function FaResults({ faPlayers, roster, positionNeeds, categoryNeeds, remaining,
   );
 }
 
-function FaAnalyzerTab({ roster, league, onFaabChange }) {
+function FaAnalyzerTab({ roster, league, onFaabChange, news, onGoToNews,
+    mlbDir, dirLoading, dirLoaded, dirError, lastUpdated, onLoadDirectory,
+    pendingFaFile, onClearPendingFa }) {
   const [faPlayers,  setFaPlayers]  = useState([]);   // players user has selected to evaluate
   const [importPool, setImportPool] = useState([]);   // all players from last FA CSV upload
   const [faabInput,  setFaabInput]  = useState(String(league.remainingFaab));
-  const [mlbDir,     setMlbDir]     = useState([]);
-  const [dirLoading, setDirLoading] = useState(false);
-  const [dirLoaded,  setDirLoaded]  = useState(false);
-  const [dirError,   setDirError]   = useState(null);
-  const [lastUpdated,setLastUpdated]= useState(null);
   const [faFilter,   setFaFilter]   = useState("targets");
   const [posFilter,  setPosFilter]  = useState("all");
   const fileRef = useRef();
@@ -1720,7 +2104,7 @@ function FaAnalyzerTab({ roster, league, onFaabChange }) {
   const { positionNeeds, categoryNeeds } = useMemo(()=>roster ? analyzeNeeds(roster) : { positionNeeds:[], categoryNeeds:[] },[roster]);
 
   const ownedNames = useMemo(()=>
-    new Set((roster?.all||[]).map(p=>p.name)),
+    new Set((roster ? roster.all : []).map(p=>p.name)),
   [roster]);
 
   // IDs of players already in the evaluation list (to show "✓ Evaluating" in picker)
@@ -1730,67 +2114,83 @@ function FaAnalyzerTab({ roster, league, onFaabChange }) {
   const removeFa = (id) => setFaPlayers(p => p.filter(x => x.id !== id));
   const clearPool = () => setImportPool([]);
 
-  // Load live MLB + AAA player directory from MLB Stats API
-  const loadDirectory = async () => {
-    setDirLoading(true); setDirError(null);
-    try {
-      const players = await fetchMLBDirectory();
-      setMlbDir(players);
-      setDirLoaded(true);
-      setLastUpdated(new Date().toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit"}));
-    } catch(e) {
-      setDirError("Could not reach MLB Stats API. Check your internet connection and try again.");
-    } finally {
-      setDirLoading(false);
-    }
-  };
-
-  // Import FA CSV → score all players → populate import pool for selection
-  // Auto-detects Fantrax format: "Players → Free Agents" flat export vs "Team Roster" sectioned export
-  const handleFaFile = (file) => {
-    if (!file?.name.endsWith(".csv")) return;
+  // Process FA CSV file (called from inline upload or from onboarding pendingFaFile)
+  const processFaFile = (file) => {
+    if (!file || !file.name.endsWith(".csv")) return;
     const reader = new FileReader();
-    reader.onload = e => {
+    reader.onload = function(ev) {
       try {
-        const text  = e.target.result;
-        const lines = text.split(/\r?\n/).filter(l => l.trim());
-
-        // Detect format: FA export has "FP/G" column in header; roster export has section headers
+        const text  = ev.target.result;
+        const lines = text.split(/\r?\n/).filter(function(l){ return l.trim(); });
         const firstLine   = lines[0] || "";
-        const isFAExport  = parseCSVLine(firstLine).some(h => h.replace(/"/g,"").trim() === "FP/G");
-        const rawPlayers  = isFAExport
-          ? parseFantraxFACSV(text)
-          : parseFantraxCSV(text).all;
-
+        const isFAExport  = parseCSVLine(firstLine).some(function(h){ return h.replace(/"/g,"").trim() === "FP/G"; });
+        const rawPlayers  = isFAExport ? parseFantraxFACSV(text) : parseFantraxCSV(text).all;
         if (rawPlayers.length === 0) return;
-
-        const active = roster ? roster.all.filter(p => p.status === "Act") : [];
+        const active = roster ? roster.all.filter(function(p){ return p.status === "Act"; }) : [];
         const ts     = Date.now();
-
-        const pool = rawPlayers.map((p, idx) => {
-          const fa = {
-            ...p,
-            id:         `fa-csv-${p.id || p.name}-${ts}-${idx}`,
-            fromImport: true,
-          };
-          const { score: fitScore } = faFitScore(fa, positionNeeds, categoryNeeds, active);
-          const ds       = dynastyScore(fa);
-          const verdict  = faVerdict(fitScore, ds);
-          const combined = fitScore * 0.65 + ds * 0.35;
-          return { ...fa, _fitScore: fitScore, _dynastyScore: ds, _verdict: verdict.label, _combined: combined };
-        }).sort((a, b) => b._combined - a._combined);
-
+        const pool = rawPlayers.map(function(p, idx) {
+          var fa = Object.assign({}, p, { id: "fa-csv-" + (p.id || p.name) + "-" + ts + "-" + idx, fromImport: true });
+          var fitResult = faFitScore(fa, positionNeeds, categoryNeeds, active);
+          var ds       = dynastyScore(fa);
+          var verdict  = faVerdict(fitResult.score, ds);
+          var combined = fitResult.score * 0.65 + ds * 0.35;
+          return Object.assign({}, fa, { _fitScore: fitResult.score, _dynastyScore: ds, _verdict: verdict.label, _combined: combined });
+        }).sort(function(a, b){ return b._combined - a._combined; });
         setImportPool(pool);
       } catch(_) {}
     };
     reader.readAsText(file);
   };
 
+  // Handle FA CSV uploaded directly in FA tab
+  const handleFaFile = (file) => { processFaFile(file); };
+
+  // Process FA file that was uploaded during onboarding
+  React.useEffect(function() {
+    if (pendingFaFile) {
+      processFaFile(pendingFaFile);
+      if (onClearPendingFa) onClearPendingFa();
+    }
+  }, [pendingFaFile]);
+
   const sevColor = (s) => s==="critical"?"bg-red-100 text-red-700 border-red-200":s==="moderate"?"bg-yellow-100 text-yellow-700 border-yellow-200":"bg-blue-100 text-blue-700 border-blue-200";
   const catSevColor = (s) => s==="high"?"bg-red-100 text-red-700":s==="medium"?"bg-yellow-100 text-yellow-700":"bg-gray-100 text-gray-600";
 
+  // News-based alerts: critical injuries on active roster
+  var newsAlerts = useMemo(function() {
+    if (!news || news.length === 0) return [];
+    return news.filter(function(n) {
+      return n.severity === "critical" && (n.typeCode === "IL" || n.typeCode === "SB");
+    }).slice(0, 5);
+  }, [news]);
+
   return (
     <div className="space-y-5">
+
+      {/* ── News Alerts Banner ── */}
+      {newsAlerts.length > 0 && (
+        <div className="bg-red-50 border-2 border-red-200 rounded-xl p-4 space-y-2">
+          <div className="flex items-center justify-between">
+            <h3 className="font-bold text-red-800 text-sm">🚑 Injury Alerts — Action Required</h3>
+            {onGoToNews && (
+              <button onClick={onGoToNews} className="text-xs text-red-600 hover:underline font-semibold">View all news →</button>
+            )}
+          </div>
+          {newsAlerts.map(function(alert) {
+            return (
+              <div key={alert.id} className="flex items-start gap-2 bg-white rounded-lg px-3 py-2 border border-red-100">
+                <span className="text-sm">🚑</span>
+                <div className="flex-1 min-w-0">
+                  <span className={"text-xs font-bold mr-1.5 " + posColor(alert.playerPos)}>{alert.playerPos}</span>
+                  <span className="text-xs font-bold text-red-800">{alert.playerName}</span>
+                  <span className="text-xs text-gray-500 ml-1.5">{alert.detail || "Placed on IL"}</span>
+                </div>
+                <span className="text-xs text-red-600 font-semibold shrink-0">Need replacement</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
 
       {/* ── Live Player Directory ── */}
       <div className={`rounded-xl border-2 p-5 ${dirLoaded?"border-green-200 bg-green-50":"border-dashed border-blue-200 bg-blue-50"}`}>
@@ -1809,7 +2209,7 @@ function FaAnalyzerTab({ roster, league, onFaabChange }) {
           </div>
           <div className="flex gap-2 shrink-0">
             <button
-              onClick={loadDirectory}
+              onClick={onLoadDirectory}
               disabled={dirLoading}
               className={`text-sm font-semibold px-5 py-2 rounded-lg transition-colors ${dirLoading?"bg-gray-300 text-gray-500 cursor-not-allowed":dirLoaded?"bg-green-600 hover:bg-green-700 text-white":"bg-blue-600 hover:bg-blue-700 text-white"}`}>
               {dirLoading ? "⏳ Loading…" : dirLoaded ? "🔄 Refresh" : "⬇ Load Players"}
@@ -2604,13 +3004,9 @@ function TradeAnalysisPanel({ givePlayers, recvPlayers, roster, positionNeeds, c
 }
 
 /* ── Trade Tab ─────────────────────────────────────────────────*/
-function TradeTab({ roster, league }) {
+function TradeTab({ roster, league, mlbDir, dirLoading, dirLoaded, dirError, onLoadDirectory }) {
   const [givePlayers, setGivePlayers] = useState([]);
   const [recvPlayers, setRecvPlayers] = useState([]);
-  const [mlbDir,      setMlbDir]      = useState([]);
-  const [dirLoading,  setDirLoading]  = useState(false);
-  const [dirLoaded,   setDirLoaded]   = useState(false);
-  const [dirError,    setDirError]    = useState(null);
 
   const { positionNeeds, categoryNeeds } = useMemo(() =>
     roster ? analyzeNeeds(roster) : { positionNeeds:[], categoryNeeds:[] },
@@ -2625,19 +3021,6 @@ function TradeTab({ roster, league }) {
   const addRecv   = (p) => setRecvPlayers(prev => prev.some(x=>x.name===p.name) ? prev : [p,...prev]);
   const removeGive = (id) => setGivePlayers(p => p.filter(x=>x.id!==id));
   const removeRecv = (id) => setRecvPlayers(p => p.filter(x=>x.id!==id));
-
-  const loadDirectory = async () => {
-    setDirLoading(true); setDirError(null);
-    try {
-      const players = await fetchMLBDirectory();
-      setMlbDir(players);
-      setDirLoaded(true);
-    } catch(e) {
-      setDirError("Could not reach MLB Stats API. Check your connection and try again.");
-    } finally {
-      setDirLoading(false);
-    }
-  };
 
   // Also allow adding from current roster
   const rosterDir = useMemo(() => {
@@ -2678,7 +3061,7 @@ function TradeTab({ roster, league }) {
             {dirError && <p className="text-xs text-red-600 mt-1">⚠ {dirError}</p>}
           </div>
           <div className="flex gap-3 flex-wrap">
-            <button onClick={loadDirectory} disabled={dirLoading}
+            <button onClick={onLoadDirectory} disabled={dirLoading}
               className={`text-sm font-semibold px-5 py-2 rounded-lg transition-colors shrink-0 ${dirLoading?"bg-gray-300 text-gray-500 cursor-not-allowed":"bg-blue-600 hover:bg-blue-700 text-white"}`}>
               {dirLoading ? "⏳ Loading…" : "⬇ Load Players"}
             </button>
@@ -2693,7 +3076,7 @@ function TradeTab({ roster, league }) {
       {dirLoaded && (
         <div className="bg-green-50 border border-green-200 rounded-xl px-4 py-2.5 flex items-center justify-between">
           <p className="text-xs text-green-700 font-semibold">✓ Directory loaded — {mlbDir.length.toLocaleString()} players searchable (MLB · AAA · AA · High-A · Low-A)</p>
-          <button onClick={loadDirectory} disabled={dirLoading} className="text-xs text-green-600 hover:underline">{dirLoading?"Refreshing…":"Refresh"}</button>
+          <button onClick={onLoadDirectory} disabled={dirLoading} className="text-xs text-green-600 hover:underline">{dirLoading?"Refreshing…":"Refresh"}</button>
         </div>
       )}
 
@@ -2813,6 +3196,289 @@ function TradeTab({ roster, league }) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
+   ONBOARDING MODAL  — mandatory first-run walkthrough
+   ═══════════════════════════════════════════════════════════════ */
+function OnboardingModal({ leagueName, onRosterFile, roster, onFaFile, onComplete }) {
+  const [step,        setStep]        = useState(0);
+  const [dragging,    setDragging]    = useState(false);
+  const [fileError,   setFileError]   = useState(null);
+  const [fileName,    setFileName]    = useState(null);
+  const [faDragging,  setFaDragging]  = useState(false);
+  const [faFileName,  setFaFileName]  = useState(null);
+  const [faUploaded,  setFaUploaded]  = useState(false);
+  const fileRef   = useRef();
+  const faFileRef = useRef();
+
+  // Advance to step 2 (summary) as soon as roster lands
+  const prevRoster = useRef(null);
+  React.useEffect(function() {
+    if (roster && !prevRoster.current && step === 1) {
+      setStep(2);
+    }
+    prevRoster.current = roster;
+  }, [roster, step]);
+
+  function handleDrop(e) {
+    e.preventDefault(); setDragging(false);
+    var file = e.dataTransfer.files && e.dataTransfer.files[0];
+    tryFile(file);
+  }
+
+  function tryFile(file) {
+    if (!file) return;
+    if (!file.name.endsWith(".csv")) {
+      setFileError("Please upload a .csv file exported from Fantrax."); return;
+    }
+    setFileError(null);
+    setFileName(file.name);
+    onRosterFile(file);
+  }
+
+  function tryFaFile(file) {
+    if (!file) return;
+    if (!file.name.endsWith(".csv")) return;
+    setFaFileName(file.name);
+    setFaUploaded(true);
+    if (onFaFile) onFaFile(file);
+  }
+
+  var STEPS = ["Welcome", "Upload Roster", "What's Next", "You're Ready!"];
+  var pct   = Math.round((step / (STEPS.length - 1)) * 100);
+
+  /* ── STEP 0: Welcome ── */
+  function StepWelcome() {
+    return (
+      <div className="text-center px-2">
+        <div className="text-6xl mb-4">⚾</div>
+        <h2 className="text-2xl font-black text-gray-900 mb-2">{leagueName}</h2>
+        <p className="text-gray-500 text-sm mb-6 max-w-xs mx-auto">Your personal dynasty advisor. Before we start, let's get everything connected so you get the best recommendations.</p>
+        <div className="grid grid-cols-2 gap-3 mb-8 text-left">
+          {[
+            ["🎯","Moves","Smart adds, drops & lineup decisions"],
+            ["🔍","FA Analyzer","Rank every free agent for your team"],
+            ["⚖️","Trade Analyzer","Dynasty-weighted trade grades"],
+            ["📰","Live News","Injury alerts & roster updates"],
+          ].map(function(row) {
+            return (
+              <div key={row[0]} className="bg-slate-50 rounded-xl p-3 border border-slate-200">
+                <div className="text-xl mb-1">{row[0]}</div>
+                <div className="font-bold text-gray-800 text-xs">{row[1]}</div>
+                <div className="text-xs text-gray-400 mt-0.5 leading-snug">{row[2]}</div>
+              </div>
+            );
+          })}
+        </div>
+        <p className="text-xs text-gray-400 mb-5">Takes about 2 minutes. You'll need your Fantrax roster CSV.</p>
+        <button
+          onClick={function() { setStep(1); }}
+          className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-xl text-sm transition-colors"
+        >
+          Get Started →
+        </button>
+      </div>
+    );
+  }
+
+  /* ── STEP 1: Upload Roster CSV ── */
+  function StepRoster() {
+    return (
+      <div>
+        <h2 className="text-lg font-black text-gray-900 mb-1">Upload Your Fantrax Roster</h2>
+        <p className="text-sm text-gray-500 mb-5">This is the core of the app — everything runs from your roster CSV.</p>
+
+        {/* How to export instructions */}
+        <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 mb-5">
+          <p className="text-xs font-bold text-blue-800 mb-2">How to export from Fantrax:</p>
+          <ol className="text-xs text-blue-700 space-y-1.5">
+            <li className="flex gap-2"><span className="bg-blue-200 text-blue-900 font-bold rounded-full w-4 h-4 flex items-center justify-center shrink-0 text-xs">1</span>Go to <strong>My Team → Roster</strong></li>
+            <li className="flex gap-2"><span className="bg-blue-200 text-blue-900 font-bold rounded-full w-4 h-4 flex items-center justify-center shrink-0 text-xs">2</span>Scroll to the bottom of the page</li>
+            <li className="flex gap-2"><span className="bg-blue-200 text-blue-900 font-bold rounded-full w-4 h-4 flex items-center justify-center shrink-0 text-xs">3</span>Click <strong>Export → CSV</strong></li>
+            <li className="flex gap-2"><span className="bg-blue-200 text-blue-900 font-bold rounded-full w-4 h-4 flex items-center justify-center shrink-0 text-xs">4</span>Upload the downloaded file below</li>
+          </ol>
+        </div>
+
+        {/* Drop zone */}
+        <div
+          className={"border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-colors mb-3 " + (dragging ? "border-blue-400 bg-blue-50" : "border-gray-300 hover:border-blue-300 hover:bg-slate-50")}
+          onClick={function() { fileRef.current && fileRef.current.click(); }}
+          onDragOver={function(e) { e.preventDefault(); setDragging(true); }}
+          onDragLeave={function() { setDragging(false); }}
+          onDrop={handleDrop}
+        >
+          <div className="text-3xl mb-2">📁</div>
+          <p className="text-sm font-semibold text-gray-700">Drag your CSV here, or click to browse</p>
+          <p className="text-xs text-gray-400 mt-1">Fantrax Team Roster export (.csv)</p>
+          <input ref={fileRef} type="file" accept=".csv" className="hidden" onChange={function(e) { tryFile(e.target.files && e.target.files[0]); }}/>
+        </div>
+
+        {fileName && !roster && (
+          <div className="flex items-center gap-2 bg-blue-50 border border-blue-200 rounded-lg px-3 py-2 text-xs text-blue-700 mb-3">
+            <span className="animate-pulse">⏳</span> Processing {fileName}…
+          </div>
+        )}
+        {fileError && (
+          <div className="bg-red-50 border border-red-200 rounded-lg px-3 py-2 text-xs text-red-700 mb-3">{fileError}</div>
+        )}
+
+        <p className="text-xs text-gray-400 text-center">You can re-upload your roster any time using the button in the header.</p>
+      </div>
+    );
+  }
+
+  /* ── STEP 2: What's Next ── */
+  function StepWhatsNext() {
+    var active  = roster ? roster.all.filter(function(p) { return p.status === "Act"; }).length : 0;
+    var reserve = roster ? roster.all.filter(function(p) { return p.status === "Res"; }).length : 0;
+    var minors  = roster ? roster.all.filter(function(p) { return p.status === "Min"; }).length : 0;
+    return (
+      <div>
+        {/* Roster success banner */}
+        <div className="bg-green-50 border border-green-200 rounded-xl p-4 mb-5 flex items-start gap-3">
+          <span className="text-2xl">✅</span>
+          <div>
+            <p className="font-bold text-green-800 text-sm">Roster loaded — {roster ? roster.all.length : 0} players</p>
+            <p className="text-xs text-green-700 mt-0.5">{active} active · {reserve} reserve · {minors} minors</p>
+            <p className="text-xs text-green-600 mt-1">News feed is fetching updates for your players now.</p>
+          </div>
+        </div>
+
+        {/* FA CSV Upload */}
+        <div className="mb-5">
+          <h2 className="text-base font-black text-gray-900 mb-0.5">Upload Your FA List <span className="text-xs font-normal text-gray-400 ml-1">— optional but recommended</span></h2>
+          <p className="text-xs text-gray-500 mb-3">We'll pre-rank every free agent for your team so you know exactly who to target.</p>
+
+          <div className="bg-blue-50 border border-blue-200 rounded-xl px-4 py-2.5 mb-3">
+            <p className="text-xs text-blue-800 font-semibold mb-1">How to export from Fantrax:</p>
+            <p className="text-xs text-blue-700">Go to <strong>Players → Free Agents</strong>, scroll to the bottom, click <strong>Export → CSV</strong></p>
+          </div>
+
+          {faUploaded ? (
+            <div className="flex items-center gap-2 bg-green-50 border border-green-200 rounded-xl px-4 py-3">
+              <span className="text-xl">✅</span>
+              <div>
+                <p className="font-bold text-green-800 text-sm">FA list uploaded!</p>
+                <p className="text-xs text-green-700">{faFileName} — will be ranked when the app loads</p>
+              </div>
+            </div>
+          ) : (
+            <div
+              className={"border-2 border-dashed rounded-xl p-6 text-center cursor-pointer transition-colors " + (faDragging ? "border-green-400 bg-green-50" : "border-gray-300 hover:border-green-300 hover:bg-slate-50")}
+              onClick={function() { faFileRef.current && faFileRef.current.click(); }}
+              onDragOver={function(e) { e.preventDefault(); setFaDragging(true); }}
+              onDragLeave={function() { setFaDragging(false); }}
+              onDrop={function(e) { e.preventDefault(); setFaDragging(false); tryFaFile(e.dataTransfer.files && e.dataTransfer.files[0]); }}
+            >
+              <div className="text-2xl mb-1">📋</div>
+              <p className="text-sm font-semibold text-gray-700">Drag FA CSV here, or click to browse</p>
+              <p className="text-xs text-gray-400 mt-0.5">Fantrax Free Agents export (.csv)</p>
+              <input ref={faFileRef} type="file" accept=".csv" className="hidden" onChange={function(e) { tryFaFile(e.target.files && e.target.files[0]); }}/>
+            </div>
+          )}
+        </div>
+
+        {/* Player Directory note */}
+        <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 mb-5 flex items-start gap-3">
+          <span className="text-lg">🌐</span>
+          <div>
+            <p className="font-bold text-amber-800 text-sm">Live Player Directory — auto-loading when you finish</p>
+            <p className="text-xs text-amber-700 mt-0.5">MLB, AAA, AA, High-A and Low-A players with live stats. Powers FA search and Trade Analyzer. Will start loading automatically when you click Done.</p>
+          </div>
+        </div>
+
+        <button
+          onClick={function() { setStep(3); }}
+          className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-xl text-sm transition-colors"
+        >
+          {faUploaded ? "Great — show me the app →" : "Skip for now →"}
+        </button>
+        <p className="text-xs text-center text-gray-400 mt-2">You can upload your FA list any time in the FA Analyzer tab.</p>
+      </div>
+    );
+  }
+
+  /* ── STEP 3: Ready ── */
+  function StepReady() {
+    return (
+      <div className="text-center px-2">
+        <div className="text-5xl mb-4">🏆</div>
+        <h2 className="text-xl font-black text-gray-900 mb-2">You're all set!</h2>
+        <p className="text-gray-500 text-sm mb-6 max-w-xs mx-auto">Your roster is loaded and we're fetching live news. Head to the Moves tab for your first recommendations.</p>
+        <div className="space-y-2 mb-8 text-left">
+          <div className="flex items-center gap-3 bg-green-50 border border-green-200 rounded-xl px-4 py-3">
+            <span className="text-lg">✅</span>
+            <div><p className="font-bold text-green-800 text-xs">Roster CSV uploaded</p><p className="text-green-700 text-xs">{roster ? roster.all.length : 0} players loaded</p></div>
+          </div>
+          <div className="flex items-center gap-3 bg-green-50 border border-green-200 rounded-xl px-4 py-3">
+            <span className="text-lg">✅</span>
+            <div><p className="font-bold text-green-800 text-xs">Live news feed active</p><p className="text-green-700 text-xs">Checking Rotowire, CBS Sports, Yahoo &amp; MLB.com</p></div>
+          </div>
+          {faUploaded ? (
+            <div className="flex items-center gap-3 bg-green-50 border border-green-200 rounded-xl px-4 py-3">
+              <span className="text-lg">✅</span>
+              <div><p className="font-bold text-green-800 text-xs">FA list uploaded</p><p className="text-green-700 text-xs">Will be ranked and ready in the FA Analyzer</p></div>
+            </div>
+          ) : (
+            <div className="flex items-center gap-3 bg-gray-50 border border-gray-200 rounded-xl px-4 py-3">
+              <span className="text-lg">⏭</span>
+              <div><p className="font-bold text-gray-600 text-xs">FA list — skipped</p><p className="text-gray-500 text-xs">Upload anytime in the FA Analyzer tab</p></div>
+            </div>
+          )}
+          <div className="flex items-center gap-3 bg-blue-50 border border-blue-200 rounded-xl px-4 py-3">
+            <span className="text-lg">🚀</span>
+            <div><p className="font-bold text-blue-800 text-xs">Player Directory — will auto-load</p><p className="text-blue-700 text-xs">MLB + all minor league levels start loading when you click Done</p></div>
+          </div>
+        </div>
+        <button
+          onClick={onComplete}
+          className="w-full bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white font-black py-4 rounded-xl text-base transition-all shadow-lg shadow-blue-500/30"
+        >
+          Done — Open My Dynasty Advisor →
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{backgroundColor: "rgba(15,23,42,0.85)", backdropFilter: "blur(4px)"}}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md max-h-screen overflow-y-auto">
+
+        {/* Progress bar */}
+        <div className="h-1.5 bg-gray-100 rounded-t-2xl overflow-hidden">
+          <div className="h-full bg-gradient-to-r from-blue-500 to-indigo-500 transition-all duration-500" style={{width: pct + "%"}}></div>
+        </div>
+
+        {/* Step indicator */}
+        <div className="flex items-center justify-between px-6 pt-4 pb-2">
+          {STEPS.map(function(label, idx) {
+            var done    = idx < step;
+            var current = idx === step;
+            return (
+              <div key={idx} className="flex flex-col items-center gap-1">
+                <div className={"w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold transition-all " + (done ? "bg-green-500 text-white" : current ? "bg-blue-600 text-white ring-4 ring-blue-100" : "bg-gray-100 text-gray-400")}>
+                  {done ? "✓" : idx + 1}
+                </div>
+                <span className={"text-xs whitespace-nowrap " + (current ? "text-blue-700 font-bold" : done ? "text-green-600" : "text-gray-400")}>{label}</span>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Divider */}
+        <div className="h-px bg-gray-100 mx-6 mb-5"></div>
+
+        {/* Step content */}
+        <div className="px-6 pb-6">
+          {step === 0 && <StepWelcome />}
+          {step === 1 && <StepRoster />}
+          {step === 2 && <StepWhatsNext />}
+          {step === 3 && <StepReady />}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════
    ROOT APP
    ═══════════════════════════════════════════════════════════════ */
 function App() {
@@ -2825,7 +3491,46 @@ function App() {
   const [league,       setLeague]       = useState(DEFAULT_LEAGUE);
   const [filename,     setFilename]     = useState(null);
   const [importDate,   setImportDate]   = useState(null);
+  const [news,            setNews]            = useState([]);
+  const [newsLoading,     setNewsLoading]     = useState(false);
+  const [newsLoaded,      setNewsLoaded]      = useState(false);
+  const [newsError,       setNewsError]       = useState(null);
+  const [onboardingDone,  setOnboardingDone]  = useState(false);
+  const [mlbDir,          setMlbDir]          = useState([]);
+  const [dirLoading,      setDirLoading]      = useState(false);
+  const [dirLoaded,       setDirLoaded]       = useState(false);
+  const [dirError,        setDirError]        = useState(null);
+  const [lastUpdated,     setLastUpdated]     = useState(null);
+  const [pendingFaFile,   setPendingFaFile]   = useState(null);
   const fileRef = useRef();
+
+  const loadDirectory = useCallback(async () => {
+    setDirLoading(true); setDirError(null);
+    try {
+      const players = await fetchMLBDirectory();
+      setMlbDir(players);
+      setDirLoaded(true);
+      setLastUpdated(new Date().toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit"}));
+    } catch(e) {
+      setDirError("Could not reach MLB Stats API. Check your internet connection and try again.");
+    } finally {
+      setDirLoading(false);
+    }
+  }, []);
+
+  const loadNews = useCallback(async (rosterPlayers) => {
+    if (!rosterPlayers || rosterPlayers.length === 0) return;
+    setNewsLoading(true); setNewsError(null);
+    try {
+      const items = await fetchPlayerNews(rosterPlayers);
+      setNews(items);
+      setNewsLoaded(true);
+    } catch(e) {
+      setNewsError("Could not load news. Check your connection and try again.");
+    } finally {
+      setNewsLoading(false);
+    }
+  }, []);
 
   const handleFile = useCallback((file) => {
     if (!file) return;
@@ -2839,10 +3544,13 @@ function App() {
         setFilename(file.name);
         setImportDate(new Date().toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}));
         setError(null); setTab("suggestions");
+        // Auto-fetch news for the new roster
+        setNews([]); setNewsLoaded(false);
+        loadNews(parsed.all);
       } catch(err) { setError(err.message); }
     };
     reader.readAsText(file);
-  }, []);
+  }, [loadNews]);
 
   const onDrop = useCallback((e)=>{e.preventDefault();setDragOver(false);handleFile(e.dataTransfer.files[0]);},[handleFile]);
 
@@ -2864,6 +3572,19 @@ function App() {
 
   return (
     <div className="min-h-screen bg-slate-50 text-sm">
+      {!onboardingDone && (
+        <OnboardingModal
+          leagueName={league.name}
+          onRosterFile={handleFile}
+          roster={roster}
+          onFaFile={setPendingFaFile}
+          onComplete={function() {
+            setOnboardingDone(true);
+            setTab("suggestions");
+            loadDirectory();
+          }}
+        />
+      )}
       {showSettings && <SettingsPanel league={league} onChange={setLeague} onClose={()=>setShowSettings(false)}/>}
 
       {/* Header */}
@@ -2880,6 +3601,11 @@ function App() {
           <div className="flex items-center gap-2 flex-wrap">
             {(counts.critical>0||counts.high>0) && (
               <span className="bg-red-500/20 border border-red-500/40 text-red-300 text-xs font-semibold px-3 py-1.5 rounded-lg">⚠ {counts.critical} critical · {counts.high} high</span>
+            )}
+            {news.filter(function(n){return n.severity==="critical";}).length > 0 && (
+              <span className="bg-red-500/20 border border-red-500/40 text-red-300 text-xs font-semibold px-3 py-1.5 rounded-lg cursor-pointer" onClick={function(){setTab("news");}}>
+                🚑 {news.filter(function(n){return n.severity==="critical";}).length} injury alert{news.filter(function(n){return n.severity==="critical";}).length!==1?"s":""}
+              </span>
             )}
             {needCount > 0 && (
               <span className="bg-orange-500/20 border border-orange-500/40 text-orange-300 text-xs font-semibold px-3 py-1.5 rounded-lg cursor-pointer" onClick={()=>setTab("fa")}>🔍 {needCount} position need{needCount!==1?"s":""}</span>
@@ -2904,6 +3630,7 @@ function App() {
             ["roster",      roster ? `👥 Roster (${counts.total})`     : "👥 Roster"],
             ["fa",          "🔍 FA Analyzer"],
             ["trade",       "⚖️ Trade"],
+            ["news",        news.filter(function(n){return n.severity==="critical";}).length > 0 ? ("📰 News 🚑" + news.filter(function(n){return n.severity==="critical";}).length) : "📰 News"],
           ].map(([id,label])=>(
             <button key={id} onClick={()=>setTab(id)}
               className={`px-5 py-3 font-medium border-b-2 whitespace-nowrap text-xs transition-colors ${tab===id?"border-blue-600 text-blue-700":"border-transparent text-gray-500 hover:text-gray-700"}`}>
@@ -3019,6 +3746,16 @@ function App() {
             roster={roster}
             league={league}
             onFaabChange={v=>setLeague(l=>({...l,remainingFaab:v}))}
+            news={news}
+            onGoToNews={function(){ setTab("news"); }}
+            mlbDir={mlbDir}
+            dirLoading={dirLoading}
+            dirLoaded={dirLoaded}
+            dirError={dirError}
+            lastUpdated={lastUpdated}
+            onLoadDirectory={loadDirectory}
+            pendingFaFile={pendingFaFile}
+            onClearPendingFa={function(){ setPendingFaFile(null); }}
           />
         )}
 
@@ -3026,6 +3763,22 @@ function App() {
           <TradeTab
             roster={roster}
             league={league}
+            mlbDir={mlbDir}
+            dirLoading={dirLoading}
+            dirLoaded={dirLoaded}
+            dirError={dirError}
+            onLoadDirectory={loadDirectory}
+          />
+        )}
+
+        {tab==="news" && (
+          <NewsTab
+            roster={roster}
+            news={news}
+            newsLoading={newsLoading}
+            newsLoaded={newsLoaded}
+            newsError={newsError}
+            onRefresh={function(){ loadNews(roster ? roster.all : []); }}
           />
         )}
       </div>
