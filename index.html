@@ -232,6 +232,15 @@ function ageTier(age) {
   return DYNASTY_AGE.find(t => age <= t.max) || DYNASTY_AGE[DYNASTY_AGE.length-1];
 }
 
+function dynastyWindow(age) {
+  if (!age || age === 0) return "Age unknown";
+  if (age <= 22) return "10+ yr dynasty window";
+  if (age <= 25) return "7–8 yr dynasty window";
+  if (age <= 27) return "4–5 yr peak window";
+  if (age <= 30) return "2–3 yr contributor";
+  return "Win-now only";
+}
+
 function dynastyScore(player) {
   const tier    = ageTier(player.age || 25);
   const agePts  = tier.score;
@@ -1787,22 +1796,13 @@ function FaCard({ fa, roster, posNeeds, catNeeds, remainingFaab, onRemove }) {
    Shows curated picks from the import pool with selectable cards.
    User clicks "+ Evaluate" to add players to the full analysis.
    ─────────────────────────────────────────────────────────────*/
-function ImportTargetPicker({ pool, roster, positionNeeds, categoryNeeds, remaining, addedIds, onAdd, onClear }) {
+function ImportTargetPicker({ pool, roster, positionNeeds, categoryNeeds, remaining, addedIds, onAdd, onClear, onCompare }) {
   const [showBrowse, setShowBrowse] = useState(false);
   const [typeFilter, setTypeFilter] = useState("all");
   const [posFilter,  setPosFilter]  = useState("all");
   const [search,     setSearch]     = useState("");
 
   // Dynasty longevity label for a player
-  function dynastyWindow(age) {
-    if (!age || age === 0) return "Age unknown";
-    if (age <= 22) return "10+ yr dynasty window";
-    if (age <= 25) return "7–8 yr dynasty window";
-    if (age <= 27) return "4–5 yr peak window";
-    if (age <= 30) return "2–3 yr contributor";
-    return "Win-now only";
-  }
-
   // Smart groupings from the pool
   const winNow = pool
     .filter(p => !p.isMinors && p._fitScore >= 20 && (p.gp > 0 || p.fpAvg > 0))
@@ -1869,16 +1869,26 @@ function ImportTargetPicker({ pool, roster, positionNeeds, categoryNeeds, remain
               <span className="text-gray-400 italic">{dynastyWindow(fa.age)}</span>
             </div>
           </div>
-          <button
-            type="button"
-            onClick={() => !isAdded && onAdd(fa)}
-            className={`shrink-0 text-xs font-bold px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap ${
-              isAdded
-                ? "bg-green-100 text-green-700 cursor-default"
-                : "bg-blue-600 hover:bg-blue-700 text-white"
-            }`}>
-            {isAdded ? "✓ Evaluating" : "+ Evaluate"}
-          </button>
+          <div className="flex flex-col gap-1 shrink-0">
+            <button
+              type="button"
+              onClick={() => !isAdded && onAdd(fa)}
+              className={`text-xs font-bold px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap ${
+                isAdded
+                  ? "bg-green-100 text-green-700 cursor-default"
+                  : "bg-blue-600 hover:bg-blue-700 text-white"
+              }`}>
+              {isAdded ? "✓ Added" : "+ Add"}
+            </button>
+            {onCompare && (
+              <button
+                type="button"
+                onClick={function() { onCompare(fa); }}
+                className="text-xs font-medium px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 transition-colors whitespace-nowrap">
+                🔍 Compare
+              </button>
+            )}
+          </div>
         </div>
         {/* Scores row */}
         <div className="flex items-center gap-3 mb-1.5 flex-wrap">
@@ -2082,9 +2092,253 @@ function ImportTargetPicker({ pool, roster, positionNeeds, categoryNeeds, remain
    Shows detailed FaCard analysis for every player the user has
    clicked "+ Evaluate" on (from picker or from manual entry).
    ─────────────────────────────────────────────────────────────*/
-// (SmartTargetCard replaced by PickCard inside ImportTargetPicker)
+/* ── SmartTargetCard — compact card used in Win Now / Dynasty Stash / Fill Your Holes ── */
+function SmartTargetCard({ fa, rank, reason, onCompare }) {
+  var tier    = ageTier(fa.age || 25);
+  var verdict = faVerdict(fa._fitScore || 0, fa._dynastyScore || 0);
+  return (
+    <div className="rounded-lg border border-gray-100 bg-white shadow-sm hover:shadow-md transition-shadow p-3">
+      {/* Name row */}
+      <div className="flex items-start justify-between gap-2 mb-1.5">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-1.5 flex-wrap mb-0.5">
+            {rank && <span className="text-xs text-gray-300 font-bold">#{rank}</span>}
+            <span className={"text-xs font-bold px-1.5 py-0.5 rounded-full shrink-0 " + posColor(fa.pos)}>{fa.pos}</span>
+            <span className="font-bold text-gray-900 text-sm leading-tight">{fa.name}</span>
+            <span className="text-gray-400 text-xs">{fa.team}</span>
+            {fa.isMinors && <span className="text-xs bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded-full font-semibold">AAA</span>}
+            {!fa.isMinors && fa.isProspect && <span className="text-xs bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded-full font-semibold">Prospect</span>}
+          </div>
+          <div className="flex items-center gap-2 text-xs">
+            <span className="text-gray-400">Age {fa.age || "?"}</span>
+            <span className={"font-semibold " + tier.color}>{tier.label}</span>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={function() { if (onCompare) onCompare(fa); }}
+          className="shrink-0 text-xs font-bold px-2.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white transition-colors whitespace-nowrap">
+          + Evaluate
+        </button>
+      </div>
+      {/* Scores */}
+      <div className="flex items-center gap-2 flex-wrap mb-1">
+        <span className={"text-xs font-bold px-1.5 py-0.5 rounded-full " + verdict.color}>{verdict.emoji} {verdict.label}</span>
+        <div className="flex items-center gap-1">
+          <span className="text-xs text-gray-400">Fit</span>
+          <div className="w-10 h-1.5 bg-gray-200 rounded-full overflow-hidden">
+            <div className={"h-full rounded-full " + (fa._fitScore>=70?"bg-green-500":fa._fitScore>=45?"bg-blue-500":fa._fitScore>=25?"bg-yellow-400":"bg-gray-300")} style={{width:(fa._fitScore||0)+"%"}}/>
+          </div>
+          <span className="text-xs font-bold text-gray-700">{fa._fitScore || 0}</span>
+        </div>
+        <div className="flex items-center gap-1">
+          <span className="text-xs text-gray-400">Dyn</span>
+          <div className="w-10 h-1.5 bg-gray-200 rounded-full overflow-hidden">
+            <div className={"h-full rounded-full " + (fa._dynastyScore>=70?"bg-emerald-500":fa._dynastyScore>=45?"bg-indigo-400":"bg-gray-400")} style={{width:(fa._dynastyScore||0)+"%"}}/>
+          </div>
+          <DynScoreTooltip player={fa} score={fa._dynastyScore || 0} />
+        </div>
+      </div>
+      {reason && <div className="text-xs text-blue-600 italic">{reason}</div>}
+    </div>
+  );
+}
+
+/* ── FaVsRosterModal — full overlay comparison view ── */
+function FaVsRosterModal({ faPlayer, roster, onClose }) {
+  var [rosterPlayer, setRosterPlayer] = React.useState(null);
+  var all     = (roster && roster.all) ? roster.all : [];
+  var active  = all.filter(function(p) { return p.status === "Act"; });
+  var reserve = all.filter(function(p) { return p.status === "Res"; });
+
+  function prodScore(p) {
+    if (!p) return 0;
+    if (p.type === "pitcher") {
+      var s = 50;
+      if (p.era > 0) s += Math.max(-25, Math.min(25, (4.00 - p.era) * 8));
+      if (p.fpAvg > 0) s += Math.min(25, p.fpAvg * 1.5);
+      return Math.max(0, Math.min(100, s));
+    }
+    var s2 = 50;
+    if (p.fpAvg > 0) s2 += Math.min(25, p.fpAvg * 2);
+    if (p.hr > 0)    s2 += Math.min(10, p.hr / 3);
+    if (p.sb > 0)    s2 += Math.min(10, p.sb / 2);
+    return Math.max(0, Math.min(100, s2));
+  }
+
+  var fprod   = prodScore(faPlayer);
+  var rprod   = prodScore(rosterPlayer);
+  var fds     = faPlayer     ? dynastyScore(faPlayer)     : 0;
+  var rds     = rosterPlayer ? dynastyScore(rosterPlayer) : 0;
+  var prodAdv = fprod - rprod;
+  var dsAdv   = fds   - rds;
+  var overall = prodAdv * 0.55 + dsAdv * 0.45;
+
+  function getVerdict() {
+    if (!rosterPlayer) return null;
+    if (overall >= 20)  return { label: "Clear Upgrade — Add the FA", emoji: "🔥", color: "bg-green-100 text-green-800 border-green-300",    desc: "The free agent is a significant improvement. Make this move." };
+    if (overall >= 8)   return { label: "Slight Upgrade", emoji: "✅", color: "bg-emerald-50 text-emerald-700 border-emerald-200", desc: "Lean toward adding the FA. There's a modest gain — weigh your FAAB budget." };
+    if (overall >= -8)  return { label: "Too Close to Call", emoji: "⚖️", color: "bg-amber-50 text-amber-700 border-amber-200",     desc: "Nearly identical value. Factor in positional fit, upcoming schedule, and cost." };
+    if (overall >= -20) return { label: "Keep Your Player", emoji: "🛡️", color: "bg-orange-50 text-orange-700 border-orange-200",  desc: "Your current player has the edge. Hold unless you have a specific reason." };
+    return               { label: "Don't Make This Move", emoji: "❌", color: "bg-red-50 text-red-700 border-red-200",            desc: "Your roster player is clearly better. Pass on this FA." };
+  }
+
+  function getPosWarn() {
+    if (!rosterPlayer || !faPlayer) return null;
+    var rPos = rosterPlayer.pos;
+    var faEligible = (faPlayer.eligible || faPlayer.pos || "").split(",").map(function(s) { return s.trim(); });
+    if (rPos && faEligible.indexOf(rPos) < 0) {
+      return faPlayer.name + " isn't eligible at " + rPos + ". Check roster flexibility before swapping.";
+    }
+    return null;
+  }
+
+  var v    = getVerdict();
+  var warn = getPosWarn();
+  var fTier = ageTier(faPlayer.age || 25);
+  var rTier = rosterPlayer ? ageTier(rosterPlayer.age || 25) : null;
+  var fds2  = dynastyScore(faPlayer);
+
+  function statBlock(p, side) {
+    if (!p) return null;
+    var isHitter = p.type !== "pitcher";
+    var ds = dynastyScore(p);
+    var dStars = ds >= 75 ? "★★★★★" : ds >= 60 ? "★★★★" : ds >= 45 ? "★★★" : ds >= 30 ? "★★" : "★";
+    var bg = side === "fa" ? "bg-blue-50 border-blue-200" : "bg-slate-50 border-slate-200";
+    var hdr = side === "fa" ? "text-blue-700" : "text-slate-700";
+    var tier = side === "fa" ? fTier : rTier;
+    return (
+      <div className={"flex-1 rounded-xl border p-4 " + bg}>
+        <div className="flex items-start justify-between mb-2">
+          <div>
+            <div className="text-xs text-gray-400 font-medium mb-0.5">{side === "fa" ? "FREE AGENT" : "YOUR PLAYER"}</div>
+            <div className={"font-black text-base leading-tight " + hdr}>{p.name}</div>
+            <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
+              <span className={"text-xs font-bold px-1.5 py-0.5 rounded " + posColor(p.pos)}>{p.pos}</span>
+              <span className="text-xs text-gray-400">{p.team}</span>
+              {p.age > 0 && <span className="text-xs text-gray-400">Age {p.age}</span>}
+              {tier && <span className={"text-xs font-semibold " + tier.color}>{tier.label}</span>}
+            </div>
+          </div>
+          <div className="text-right shrink-0">
+            <div className="text-yellow-500 text-sm tracking-tight">{dStars}</div>
+            <div className="text-xs text-gray-500 font-bold">DS {ds}</div>
+          </div>
+        </div>
+        <div className="space-y-1 mt-2 text-xs">
+          <div className="flex justify-between"><span className="text-gray-400">FP/Game</span><span className="font-bold text-gray-800">{p.fpAvg ? p.fpAvg.toFixed(1) : "0.0"}</span></div>
+          <div className="flex justify-between"><span className="text-gray-400">Games</span><span className="font-bold text-gray-800">{p.gp || 0}</span></div>
+          {isHitter ? (
+            <div>
+              {(p.hr  > 0) && <div className="flex justify-between"><span className="text-gray-400">HR</span><span className="font-bold text-gray-800">{p.hr}</span></div>}
+              {(p.sb  > 0) && <div className="flex justify-between"><span className="text-gray-400">SB</span><span className="font-bold text-gray-800">{p.sb}</span></div>}
+              {(p.rbi > 0) && <div className="flex justify-between"><span className="text-gray-400">RBI</span><span className="font-bold text-gray-800">{p.rbi}</span></div>}
+            </div>
+          ) : (
+            <div>
+              {(p.era > 0) && <div className="flex justify-between"><span className="text-gray-400">ERA</span><span className="font-bold text-gray-800">{p.era.toFixed(2)}</span></div>}
+              {(p.k   > 0) && <div className="flex justify-between"><span className="text-gray-400">K</span><span className="font-bold text-gray-800">{p.k}</span></div>}
+              {(p.sv  > 0) && <div className="flex justify-between"><span className="text-gray-400">SV</span><span className="font-bold text-gray-800">{p.sv}</span></div>}
+              {(p.ip  > 0) && <div className="flex justify-between"><span className="text-gray-400">IP</span><span className="font-bold text-gray-800">{typeof p.ip === "number" ? p.ip.toFixed(1) : p.ip}</span></div>}
+            </div>
+          )}
+        </div>
+        {p.isMinors && <div className="mt-2 text-xs bg-purple-100 text-purple-700 px-2 py-0.5 rounded-full inline-block font-semibold">AAA — Minors</div>}
+        {!p.isMinors && p.isProspect && <div className="mt-2 text-xs bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded-full inline-block font-semibold">Top Prospect</div>}
+      </div>
+    );
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{background:"rgba(0,0,0,0.6)"}}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto">
+        {/* Header */}
+        <div className="bg-gradient-to-r from-slate-900 to-blue-900 text-white px-6 py-4 rounded-t-2xl flex items-center justify-between">
+          <div>
+            <div className="font-black text-lg">🔍 FA vs Roster Comparison</div>
+            <div className="text-slate-300 text-xs mt-0.5">Should you add <span className="text-white font-semibold">{faPlayer.name}</span>?</div>
+          </div>
+          <button onClick={onClose} className="text-slate-400 hover:text-white text-2xl font-light leading-none transition-colors">×</button>
+        </div>
+
+        <div className="p-5 space-y-4">
+          {/* Roster player selector */}
+          <div>
+            <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Compare against — pick one of your players</label>
+            <select
+              className="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-400"
+              value={rosterPlayer ? rosterPlayer.id : ""}
+              onChange={function(e) {
+                var id = e.target.value;
+                var found = null;
+                for (var i = 0; i < all.length; i++) { if (all[i].id === id) { found = all[i]; break; } }
+                setRosterPlayer(found);
+              }}>
+              <option value="">— Select a roster player to compare —</option>
+              {active.length > 0 && (
+                <optgroup label="Active Roster">
+                  {active.map(function(p) { return <option key={p.id} value={p.id}>{p.name} ({p.pos}) — Age {p.age || "?"}</option>; })}
+                </optgroup>
+              )}
+              {reserve.length > 0 && (
+                <optgroup label="Reserve / IL">
+                  {reserve.map(function(p) { return <option key={p.id} value={p.id}>{p.name} ({p.pos}) — Age {p.age || "?"}</option>; })}
+                </optgroup>
+              )}
+            </select>
+            {all.length === 0 && (
+              <p className="text-xs text-amber-600 mt-1">⚠ Import your roster CSV to enable comparisons against your actual players.</p>
+            )}
+          </div>
+
+          {/* Side-by-side cards */}
+          <div className="flex flex-col sm:flex-row gap-3">
+            {statBlock(faPlayer, "fa")}
+            {rosterPlayer ? statBlock(rosterPlayer, "roster") : (
+              <div className="flex-1 rounded-xl border-2 border-dashed border-slate-200 flex items-center justify-center min-h-36">
+                <span className="text-gray-300 text-sm text-center px-4">Select a roster player above to see the comparison</span>
+              </div>
+            )}
+          </div>
+
+          {/* Head-to-head stat table */}
+          {rosterPlayer && (
+            <CompareTable rp={rosterPlayer} fp={faPlayer} />
+          )}
+
+          {/* System verdict */}
+          {v && (
+            <div className={"rounded-xl border px-5 py-4 " + v.color}>
+              <div className="font-black text-sm mb-1">{v.emoji} System Verdict: {v.label}</div>
+              <div className="text-xs opacity-80 mb-2">{v.desc}</div>
+              <div className="flex gap-4 text-xs opacity-70 flex-wrap">
+                <span>Production edge: <strong>{prodAdv >= 0 ? "+" : ""}{prodAdv.toFixed(0)}</strong> ({prodAdv >= 0 ? "FA leads" : "Your player leads"})</span>
+                <span>Dynasty edge: <strong>{dsAdv >= 0 ? "+" : ""}{dsAdv.toFixed(0)}</strong> ({dsAdv >= 0 ? "FA leads" : "Your player leads"})</span>
+              </div>
+              {warn && <div className="mt-2 text-xs font-semibold">⚠ {warn}</div>}
+            </div>
+          )}
+
+          {/* Dynasty context for the FA */}
+          <div className="bg-slate-50 rounded-xl p-4 text-xs text-gray-500 space-y-1">
+            <div className="font-semibold text-gray-700 mb-1">Dynasty context for {faPlayer.name}</div>
+            <div>Dynasty Score: <strong className="text-gray-800">{fds2}/100</strong> — {fds2 >= 70 ? "Elite dynasty asset" : fds2 >= 50 ? "Solid dynasty piece" : fds2 >= 30 ? "Moderate dynasty value" : "Low dynasty value"}</div>
+            <div>Age window: <strong className="text-gray-800">{dynastyWindow(faPlayer.age)}</strong></div>
+            {faPlayer._fitScore != null && <div>Team fit score: <strong className="text-gray-800">{faPlayer._fitScore}/100</strong></div>}
+          </div>
+
+          {/* Close button */}
+          <div className="flex justify-end pt-1">
+            <button onClick={onClose} className="px-5 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-sm font-medium text-slate-700 transition-colors">Close</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function FaResults({ faPlayers, roster, positionNeeds, categoryNeeds, remaining, faFilter, posFilter, setFaFilter, setPosFilter, removeFa }) {
+  const [compareTarget, setCompareTarget] = React.useState(null);
   const active = roster ? roster.all.filter(p => p.status === "Act") : [];
 
   // Score every player (reuse pre-computed values from bulk import if present)
@@ -2146,6 +2400,13 @@ function FaResults({ faPlayers, roster, positionNeeds, categoryNeeds, remaining,
 
   return (
     <div>
+      {compareTarget && (
+        <FaVsRosterModal
+          faPlayer={compareTarget}
+          roster={roster}
+          onClose={function() { setCompareTarget(null); }}
+        />
+      )}
 
       {/* ── Bulk import summary banner ── */}
       {bulkCount > 0 && (
@@ -2194,6 +2455,7 @@ function FaResults({ faPlayers, roster, positionNeeds, categoryNeeds, remaining,
                 <div className="space-y-3">
                   {winNow.map((fa, i) => (
                     <SmartTargetCard key={fa.id} fa={fa} rank={i+1}
+                      onCompare={function(p) { setCompareTarget(p); }}
                       reason={
                         i===0 ? "Top overall fit for your roster" :
                         i===1 ? "Strong secondary option" :
@@ -2220,6 +2482,7 @@ function FaResults({ faPlayers, roster, positionNeeds, categoryNeeds, remaining,
                     const tier = ageTier(fa.age || 25);
                     return (
                       <SmartTargetCard key={fa.id} fa={fa} rank={i+1}
+                        onCompare={function(p) { setCompareTarget(p); }}
                         reason={
                           fa.isMinors ? `${tier.label} — stash while available` :
                           (fa.age||99) <= 22 ? "Elite prospect window — grab now" :
@@ -2245,6 +2508,7 @@ function FaResults({ faPlayers, roster, positionNeeds, categoryNeeds, remaining,
                 <div className="space-y-3">
                   {needFills.map(({ need, player }) => (
                     <SmartTargetCard key={player.id} fa={player}
+                      onCompare={function(p) { setCompareTarget(p); }}
                       reason={`Best available ${need.label} — ${need.note}`}/>
                   ))}
                 </div>
@@ -2307,12 +2571,13 @@ function FaResults({ faPlayers, roster, positionNeeds, categoryNeeds, remaining,
 
 function FaAnalyzerTab({ roster, league, onFaabChange, news, onGoToNews,
     mlbDir, dirLoading, dirLoaded, dirError, lastUpdated, onLoadDirectory,
-    pendingFaFile, onClearPendingFa }) {
-  const [faPlayers,  setFaPlayers]  = useState([]);   // players user has selected to evaluate
-  const [importPool, setImportPool] = useState([]);   // all players from last FA CSV upload
-  const [faabInput,  setFaabInput]  = useState(String(league.remainingFaab));
-  const [faFilter,   setFaFilter]   = useState("targets");
-  const [posFilter,  setPosFilter]  = useState("all");
+    pendingFaText, onClearPendingFa }) {
+  const [faPlayers,     setFaPlayers]     = useState([]);   // players user has selected to evaluate
+  const [importPool,    setImportPool]    = useState([]);   // all players from last FA CSV upload
+  const [faabInput,     setFaabInput]     = useState(String(league.remainingFaab));
+  const [faFilter,      setFaFilter]      = useState("targets");
+  const [posFilter,     setPosFilter]     = useState("all");
+  const [compareTarget, setCompareTarget] = useState(null); // player being compared vs roster
   const fileRef = useRef();
 
   const remaining = parseInt(faabInput)||0;
@@ -2329,44 +2594,46 @@ function FaAnalyzerTab({ roster, league, onFaabChange, news, onGoToNews,
   const removeFa = (id) => setFaPlayers(p => p.filter(x => x.id !== id));
   const clearPool = () => setImportPool([]);
 
-  // Process FA CSV file (called from inline upload or from onboarding pendingFaFile)
+  // Core: process CSV text string into import pool
+  const processCsvText = (text) => {
+    try {
+      const lines = text.split(/\r?\n/).filter(function(l){ return l.trim(); });
+      const firstLine  = lines[0] || "";
+      const isFAExport = parseCSVLine(firstLine).some(function(h){ return h.replace(/"/g,"").trim() === "FP/G"; });
+      const rawPlayers = isFAExport ? parseFantraxFACSV(text) : parseFantraxCSV(text).all;
+      if (rawPlayers.length === 0) return;
+      const active = roster ? roster.all.filter(function(p){ return p.status === "Act"; }) : [];
+      const ts     = Date.now();
+      const pool = rawPlayers.map(function(p, idx) {
+        var fa = Object.assign({}, p, { id: "fa-csv-" + (p.id || p.name) + "-" + ts + "-" + idx, fromImport: true });
+        var fitResult = faFitScore(fa, positionNeeds, categoryNeeds, active);
+        var ds        = dynastyScore(fa);
+        var verdict   = faVerdict(fitResult.score, ds);
+        var combined  = fitResult.score * 0.65 + ds * 0.35;
+        return Object.assign({}, fa, { _fitScore: fitResult.score, _dynastyScore: ds, _verdict: verdict.label, _combined: combined });
+      }).sort(function(a, b){ return b._combined - a._combined; });
+      setImportPool(pool);
+    } catch(e) {}
+  };
+
+  // Inline tab upload: File → text → processCsvText
   const processFaFile = (file) => {
     if (!file || !file.name.endsWith(".csv")) return;
     const reader = new FileReader();
-    reader.onload = function(ev) {
-      try {
-        const text  = ev.target.result;
-        const lines = text.split(/\r?\n/).filter(function(l){ return l.trim(); });
-        const firstLine   = lines[0] || "";
-        const isFAExport  = parseCSVLine(firstLine).some(function(h){ return h.replace(/"/g,"").trim() === "FP/G"; });
-        const rawPlayers  = isFAExport ? parseFantraxFACSV(text) : parseFantraxCSV(text).all;
-        if (rawPlayers.length === 0) return;
-        const active = roster ? roster.all.filter(function(p){ return p.status === "Act"; }) : [];
-        const ts     = Date.now();
-        const pool = rawPlayers.map(function(p, idx) {
-          var fa = Object.assign({}, p, { id: "fa-csv-" + (p.id || p.name) + "-" + ts + "-" + idx, fromImport: true });
-          var fitResult = faFitScore(fa, positionNeeds, categoryNeeds, active);
-          var ds       = dynastyScore(fa);
-          var verdict  = faVerdict(fitResult.score, ds);
-          var combined = fitResult.score * 0.65 + ds * 0.35;
-          return Object.assign({}, fa, { _fitScore: fitResult.score, _dynastyScore: ds, _verdict: verdict.label, _combined: combined });
-        }).sort(function(a, b){ return b._combined - a._combined; });
-        setImportPool(pool);
-      } catch(_) {}
-    };
+    reader.onload = function(ev) { processCsvText(ev.target.result); };
     reader.readAsText(file);
   };
 
   // Handle FA CSV uploaded directly in FA tab
   const handleFaFile = (file) => { processFaFile(file); };
 
-  // Process FA file that was uploaded during onboarding
+  // Process FA CSV text that was pre-read during onboarding (already a string — no FileReader needed)
   React.useEffect(function() {
-    if (pendingFaFile) {
-      processFaFile(pendingFaFile);
+    if (pendingFaText) {
+      processCsvText(pendingFaText);
       if (onClearPendingFa) onClearPendingFa();
     }
-  }, [pendingFaFile]);
+  }, [pendingFaText]);
 
   const sevColor = (s) => s==="critical"?"bg-red-100 text-red-700 border-red-200":s==="moderate"?"bg-yellow-100 text-yellow-700 border-yellow-200":"bg-blue-100 text-blue-700 border-blue-200";
   const catSevColor = (s) => s==="high"?"bg-red-100 text-red-700":s==="medium"?"bg-yellow-100 text-yellow-700":"bg-gray-100 text-gray-600";
@@ -2506,9 +2773,6 @@ function FaAnalyzerTab({ roster, league, onFaabChange, news, onGoToNews,
         </div>
       </div>
 
-      {/* Add FA players */}
-      <FaForm onAdd={addFa} mlbDir={mlbDir} ownedNames={ownedNames}/>
-
       {/* ── Lineup vs FA Comparison ── */}
       <LineupVsFACompare
         roster={roster}
@@ -2545,6 +2809,7 @@ function FaAnalyzerTab({ roster, league, onFaabChange, news, onGoToNews,
           addedIds={addedIds}
           onAdd={addFa}
           onClear={clearPool}
+          onCompare={function(p) { setCompareTarget(p); }}
         />
       )}
 
@@ -2568,6 +2833,15 @@ function FaAnalyzerTab({ roster, league, onFaabChange, news, onGoToNews,
             removeFa={removeFa}
           />
         </div>
+      )}
+
+      {/* ── FA vs Roster comparison modal (opened from picker or smart targets) ── */}
+      {compareTarget && (
+        <FaVsRosterModal
+          faPlayer={compareTarget}
+          roster={roster}
+          onClose={function() { setCompareTarget(null); }}
+        />
       )}
     </div>
   );
@@ -3454,7 +3728,12 @@ function OnboardingModal({ leagueName, onRosterFile, roster, onFaFile, onComplet
     if (!file.name.endsWith(".csv")) return;
     setFaFileName(file.name);
     setFaUploaded(true);
-    if (onFaFile) onFaFile(file);
+    // Read to text immediately — File objects can become stale once React re-renders
+    var reader = new FileReader();
+    reader.onload = function(ev) {
+      if (onFaFile) onFaFile(ev.target.result); // pass CSV text string, not File
+    };
+    reader.readAsText(file);
   }
 
   var STEPS = ["Welcome", "Upload Roster", "What's Next", "You're Ready!"];
@@ -3604,9 +3883,9 @@ function OnboardingModal({ leagueName, onRosterFile, roster, onFaFile, onComplet
           onClick={function() { setStep(3); }}
           className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-xl text-sm transition-colors"
         >
-          {faUploaded ? "Great — show me the app →" : "Skip for now →"}
+          Next →
         </button>
-        <p className="text-xs text-center text-gray-400 mt-2">You can upload your FA list any time in the FA Analyzer tab.</p>
+        <p className="text-xs text-center text-gray-400 mt-2">FA list is optional — you can upload it any time in the FA Analyzer tab.</p>
       </div>
     );
   }
@@ -3716,7 +3995,7 @@ function App() {
   const [dirLoaded,       setDirLoaded]       = useState(false);
   const [dirError,        setDirError]        = useState(null);
   const [lastUpdated,     setLastUpdated]     = useState(null);
-  const [pendingFaFile,   setPendingFaFile]   = useState(null);
+  const [pendingFaText,   setPendingFaText]   = useState(null);
   const fileRef = useRef();
 
   const loadDirectory = useCallback(async () => {
@@ -3792,7 +4071,7 @@ function App() {
           leagueName={league.name}
           onRosterFile={handleFile}
           roster={roster}
-          onFaFile={setPendingFaFile}
+          onFaFile={setPendingFaText}
           onComplete={function() {
             setOnboardingDone(true);
             setTab("suggestions");
@@ -3956,7 +4235,8 @@ function App() {
           </div>
         )}
 
-        {tab==="fa" && (
+        {/* FaAnalyzerTab stays mounted always so pendingFaText processes in background */}
+        <div style={{display: tab==="fa" ? "block" : "none"}}>
           <FaAnalyzerTab
             roster={roster}
             league={league}
@@ -3969,10 +4249,10 @@ function App() {
             dirError={dirError}
             lastUpdated={lastUpdated}
             onLoadDirectory={loadDirectory}
-            pendingFaFile={pendingFaFile}
-            onClearPendingFa={function(){ setPendingFaFile(null); }}
+            pendingFaText={pendingFaText}
+            onClearPendingFa={function(){ setPendingFaText(null); }}
           />
-        )}
+        </div>
 
         {tab==="trade" && (
           <TradeTab
