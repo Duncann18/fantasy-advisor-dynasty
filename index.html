@@ -3685,6 +3685,580 @@ function TradeTab({ roster, league, mlbDir, dirLoading, dirLoaded, dirError, onL
 }
 
 /* ═══════════════════════════════════════════════════════════════
+   ADVISOR BOT  — natural-language lineup & roster assistant
+   ═══════════════════════════════════════════════════════════════ */
+
+/* ── Query helpers ── */
+function advisorFindPlayers(query, mlbDir, roster) {
+  var lq = query.toLowerCase();
+  var seen = new Set();
+  var results = [];
+  var pool = [];
+  if (mlbDir && mlbDir.length) pool = pool.concat(mlbDir);
+  if (roster && roster.all) pool = pool.concat(roster.all);
+  pool.forEach(function(p) {
+    if (seen.has(p.name)) return;
+    var nl = p.name.toLowerCase();
+    var parts = nl.split(" ");
+    var last = parts[parts.length - 1];
+    if (lq.includes(nl) || (last.length >= 5 && lq.includes(last))) {
+      seen.add(p.name); results.push(p);
+    }
+  });
+  return results.slice(0, 4);
+}
+
+function advisorStatLine(p) {
+  if (!p) return "No data";
+  if (p.type === "pitcher") {
+    return [
+      p.fpAvg ? p.fpAvg.toFixed(1)+" FP/G" : null,
+      p.gp > 0 ? p.gp+" G" : null,
+      p.ip ? (typeof p.ip==="number" ? p.ip.toFixed(1) : p.ip)+" IP" : null,
+      p.era > 0 ? "ERA "+p.era.toFixed(2) : null,
+      p.k > 0 ? p.k+" K" : null,
+      p.sv > 0 ? p.sv+" SV" : null,
+      p.qs > 0 ? p.qs+" QS" : null,
+      p.w > 0 ? p.w+" W" : null,
+    ].filter(Boolean).join(" · ");
+  }
+  return [
+    p.fpAvg ? p.fpAvg.toFixed(1)+" FP/G" : null,
+    p.gp > 0 ? p.gp+" G" : null,
+    p.hr > 0 ? p.hr+" HR" : null,
+    p.rbi > 0 ? p.rbi+" RBI" : null,
+    p.sb > 0 ? p.sb+" SB" : null,
+    p.r > 0 ? p.r+" R" : null,
+    p.avg ? "."+String(Math.round(p.avg*1000)).padStart(3,"0")+" AVG" : null,
+  ].filter(Boolean).join(" · ");
+}
+
+function processAdvisorQuery(rawQ, roster, mlbDir, news, league) {
+  var q = rawQ.toLowerCase().trim();
+  var players = advisorFindPlayers(q, mlbDir, roster);
+
+  var isStartSit  = (q.includes("start") || q.includes("sit") || q.includes("bench")) &&
+                    (q.includes(" or ") || q.includes(" vs ") || players.length >= 2);
+  var isPlayerQ   = q.includes("tell me") || q.includes("info on") || q.includes("stats on") ||
+                    q.includes("how is") || q.includes("how's") || q.includes("who is") ||
+                    q.includes("look up") || q.includes("search for") || q.includes("show me");
+  var isDrop      = q.includes("drop") || q.includes("cut ") || q.includes("release") || q.includes("waive");
+  var isPickup    = (q.includes("add") || q.includes("pick up") || q.includes("pickup") ||
+                     q.includes("stream") || q.includes("waiver wire") || q.includes("available")) &&
+                    (q.includes("who") || q.includes("best") || q.includes("should"));
+  var isLineup    = q.includes("lineup") || q.includes("who should i start") || q.includes("my starters");
+  var isRoster    = q.includes("weakness") || q.includes("my roster") || q.includes("my team") ||
+                    q.includes("roster analysis") || q.includes("where am i weak") || q.includes("needs");
+  var isInjury    = q.includes("injur") || q.includes("hurt") || q.includes(" il ") || q.includes("day-to-day") || q.includes("disabled list");
+  var isHelp      = q === "" || q === "hi" || q === "hello" || q.includes("what can you") || q.includes("help");
+  var isDynasty   = q.includes("dynasty") || q.includes("prospect") || q.includes("long term") || q.includes("future");
+  var isTrade     = q.includes("trade") || q.includes("should i trade");
+
+  if (isHelp) return { type:"help" };
+
+  if (isStartSit && players.length >= 2) {
+    var p1 = players[0], p2 = players[1];
+    var fp1 = p1.fpAvg||0, fp2 = p2.fpAvg||0;
+    var ds1 = dynastyScore(p1), ds2 = dynastyScore(p2);
+    var rec, reason;
+    if (fp1 > fp2 * 1.12) {
+      rec = p1; reason = p1.name+" averages "+fp1.toFixed(1)+" FP/G vs "+fp2.toFixed(1)+" — clear start.";
+    } else if (fp2 > fp1 * 1.12) {
+      rec = p2; reason = p2.name+" averages "+fp2.toFixed(1)+" FP/G vs "+fp1.toFixed(1)+" — clear start.";
+    } else if (ds1 > ds2 + 12) {
+      rec = p1; reason = "Fantasy production is similar, but "+p1.name+" has better dynasty upside (DS "+ds1+" vs "+ds2+"). Lean "+p1.name+".";
+    } else if (ds2 > ds1 + 12) {
+      rec = p2; reason = "Fantasy production is similar, but "+p2.name+" has better dynasty upside (DS "+ds2+" vs "+ds1+"). Lean "+p2.name+".";
+    } else {
+      rec = fp1 >= fp2 ? p1 : p2;
+      reason = "Too close to call on pure numbers. "+rec.name+" gets a slight edge ("+Math.max(fp1,fp2).toFixed(1)+" FP/G). Check matchups and park factors.";
+    }
+    return { type:"startSit", p1:p1, p2:p2, rec:rec, reason:reason };
+  }
+
+  if ((isStartSit || q.includes("should i play") || q.includes("should i start")) && players.length === 1) {
+    var sp = players[0];
+    var sds = dynastyScore(sp);
+    var sfp = sp.fpAvg||0;
+    var sv = sfp >= 8 ? "Start" : sfp >= 5 ? "Spot start / matchup-dependent" : sfp >= 2.5 ? "Deep leagues / streaming only" : "Bench — explore alternatives";
+    return { type:"startAdvice", player:sp, verdict:sv, ds:sds };
+  }
+
+  if (isDynasty && players.length >= 1) {
+    return { type:"dynastyAdvice", players:players };
+  }
+
+  if (isTrade && players.length >= 2) {
+    var tp1 = players[0], tp2 = players[1];
+    var tds1 = dynastyScore(tp1), tds2 = dynastyScore(tp2);
+    var tfp1 = tp1.fpAvg||0, tfp2 = tp2.fpAvg||0;
+    var tScore1 = tfp1 * 0.55 + tds1 * 0.45;
+    var tScore2 = tfp2 * 0.55 + tds2 * 0.45;
+    var tRec = tScore1 >= tScore2 ? "Keep "+tp1.name : "Consider trading "+tp1.name+" for "+tp2.name;
+    return { type:"tradeAdvice", p1:tp1, p2:tp2, rec:tRec, s1:Math.round(tScore1), s2:Math.round(tScore2) };
+  }
+
+  if (players.length > 0 && (isPlayerQ || (!isDrop && !isPickup && !isLineup && !isRoster && !isInjury))) {
+    return players.length === 1
+      ? { type:"playerDetail", player:players[0] }
+      : { type:"playerList", players:players, title:"Here's what I found:" };
+  }
+
+  if (isDrop && roster) {
+    var active = roster.all.filter(function(p){ return p.status==="Act"; });
+    var scored = active.map(function(p){
+      return { p:p, score: dynastyScore(p)*0.4 + (p.fpAvg||0)*4 };
+    }).sort(function(a,b){ return a.score-b.score; });
+    return { type:"dropAdvice", players:scored.slice(0,4).map(function(x){ return x.p; }) };
+  }
+
+  if (isPickup) {
+    if (!mlbDir || !mlbDir.length) return { type:"text", text:"Player directory isn't loaded yet — go to the FA Analyzer tab and click 'Load Players', then ask me again." };
+    var owned = roster ? new Set(roster.all.map(function(p){ return p.name; })) : new Set();
+    var posNeeds2 = roster ? analyzeNeeds(roster).positionNeeds : [];
+    var rAct2 = roster ? roster.all.filter(function(p){ return p.status==="Act"; }) : [];
+    var topFa = mlbDir
+      .filter(function(p){ return !p.isMinors && !owned.has(p.name) && p.fpAvg > 0; })
+      .map(function(p){
+        var ds3 = dynastyScore(p);
+        var fit3 = faFitScore(p, posNeeds2, [], rAct2).score;
+        return Object.assign({},p,{ _dynastyScore:ds3, _fitScore:fit3, _combined:fit3*0.6+ds3*0.4 });
+      })
+      .sort(function(a,b){ return b._combined - a._combined; })
+      .slice(0,5);
+    return { type:"pickupAdvice", players:topFa };
+  }
+
+  if (isLineup && roster) {
+    var act = roster.all.filter(function(p){ return p.status==="Act"; });
+    var topH = act.filter(function(p){ return p.type==="hitter"; }).sort(function(a,b){ return (b.fpAvg||0)-(a.fpAvg||0); }).slice(0,6);
+    var topP = act.filter(function(p){ return p.type==="pitcher"; }).sort(function(a,b){ return (b.fpAvg||0)-(a.fpAvg||0); }).slice(0,5);
+    return { type:"lineupAdvice", hitters:topH, pitchers:topP };
+  }
+
+  if (isRoster && roster) {
+    var rNeeds = analyzeNeeds(roster).positionNeeds;
+    var topActv = roster.all.filter(function(p){ return p.status==="Act"; })
+      .sort(function(a,b){ return (b.fpAvg||0)-(a.fpAvg||0); }).slice(0,4);
+    return { type:"rosterAnalysis", needs:rNeeds, strengths:topActv };
+  }
+
+  if (isInjury) {
+    var injN = (news||[]).filter(function(n){
+      var hl=(n.headline||"").toLowerCase();
+      return hl.includes("injur")||hl.includes(" il ")||hl.includes("day-to-day")||hl.includes("placed on");
+    });
+    if (players.length > 0) {
+      var pName2 = players[0].name.toLowerCase();
+      var pLast2 = pName2.split(" ").slice(-1)[0];
+      var pNews2 = injN.filter(function(n){ return (n.headline||"").toLowerCase().includes(pLast2); });
+      if (pNews2.length > 0) return { type:"injuryInfo", player:players[0], news:pNews2.slice(0,3) };
+      return { type:"text", text:"No recent injury news for "+players[0].name+". They appear healthy based on the latest news feed." };
+    }
+    return { type:"injuryInfo", player:null, news:injN.slice(0,5) };
+  }
+
+  if (players.length > 0) return { type:"playerList", players:players, title:"Here's what I found:" };
+
+  return { type:"noMatch", query:rawQ };
+}
+
+/* ── Advisor sub-components (top-level for Babel) ── */
+
+function AdvisorPlayerChip({ player }) {
+  if (!player) return null;
+  var ds = dynastyScore(player);
+  var tier = ageTier(player.age||25);
+  var statLine = advisorStatLine(player);
+  var levelBadge = player.isMinors
+    ? <span className="text-xs bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded-full font-semibold ml-1">AAA</span>
+    : player.isProspect
+    ? <span className="text-xs bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded-full font-semibold ml-1">Prospect</span>
+    : null;
+  return (
+    <div className="bg-white border border-gray-200 rounded-xl p-3 shadow-sm">
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <span className={"text-xs font-bold px-1.5 py-0.5 rounded-full "+posColor(player.pos)}>{player.pos}</span>
+            <span className="font-bold text-gray-900 text-sm">{player.name}</span>
+            <span className="text-gray-400 text-xs">{player.team}</span>
+            {levelBadge}
+          </div>
+          {player.age > 0 && (
+            <div className="flex items-center gap-2 text-xs mt-0.5">
+              <span className="text-gray-400">Age {player.age}</span>
+              <span className={"font-semibold "+tier.color}>{tier.label}</span>
+              <span className="text-gray-300">·</span>
+              <span className="text-gray-400 italic">{dynastyWindow(player.age)}</span>
+            </div>
+          )}
+        </div>
+        <div className="text-right shrink-0">
+          <div className="text-xs font-black text-blue-700">{player.fpAvg ? player.fpAvg.toFixed(1) : "—"}</div>
+          <div className="text-xs text-gray-400">FP/G</div>
+        </div>
+      </div>
+      {statLine !== "No data" && <div className="text-xs text-gray-400 mt-2 leading-relaxed">{statLine}</div>}
+      <div className="flex items-center gap-3 mt-2 flex-wrap">
+        <div className="flex items-center gap-1">
+          <span className="text-xs text-gray-400">Dynasty</span>
+          <div className="w-12 h-1.5 bg-gray-200 rounded-full overflow-hidden">
+            <div className={"h-full rounded-full "+(ds>=70?"bg-emerald-500":ds>=45?"bg-indigo-400":"bg-gray-400")} style={{width:ds+"%"}}/>
+          </div>
+          <span className="text-xs font-bold text-gray-700">{ds}</span>
+        </div>
+        {player._fitScore != null && (
+          <div className="flex items-center gap-1">
+            <span className="text-xs text-gray-400">Team fit</span>
+            <div className="w-12 h-1.5 bg-gray-200 rounded-full overflow-hidden">
+              <div className={"h-full rounded-full "+(player._fitScore>=70?"bg-green-500":player._fitScore>=45?"bg-blue-500":"bg-yellow-400")} style={{width:player._fitScore+"%"}}/>
+            </div>
+            <span className="text-xs font-bold text-gray-700">{player._fitScore}</span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AdvisorBotMessage({ msg }) {
+  var r = msg.response;
+  if (!r) return null;
+
+  /* ── help ── */
+  if (r.type === "help") return (
+    <div className="space-y-2">
+      <p className="text-sm text-gray-700 font-medium">I'm your dynasty baseball advisor. Here's what I can do:</p>
+      <div className="grid grid-cols-2 gap-2 text-xs">
+        {[
+          ["🆚","Start/Sit","\"Should I start Trout or Judge?\""],
+          ["🔍","Player Lookup","\"Tell me about Jackson Chourio\""],
+          ["📋","Lineup Help","\"Who should I start this week?\""],
+          ["🏆","FA Pickups","\"Who should I add?\""],
+          ["✂️","Drop Advice","\"Who should I drop?\""],
+          ["📊","Roster Analysis","\"Where is my team weak?\""],
+          ["🚑","Injury Status","\"Is Soto injured?\""],
+          ["💎","Dynasty Value","\"Dynasty outlook for Dominguez?\""],
+        ].map(function(row){ return (
+          <div key={row[0]} className="bg-slate-50 rounded-lg p-2 border border-slate-100">
+            <div className="font-bold text-gray-700">{row[0]} {row[1]}</div>
+            <div className="text-gray-400 mt-0.5 italic">{row[2]}</div>
+          </div>
+        );
+        })}
+      </div>
+      <p className="text-xs text-gray-400 mt-1">I use your imported roster + MLB Stats API data covering all levels (MLB, AAA, AA, High-A, Low-A).</p>
+    </div>
+  );
+
+  /* ── text ── */
+  if (r.type === "text") return <p className="text-sm text-gray-700">{r.text}</p>;
+
+  /* ── playerDetail ── */
+  if (r.type === "playerDetail") return (
+    <div className="space-y-2">
+      <p className="text-xs text-gray-500 font-medium">Player profile:</p>
+      <AdvisorPlayerChip player={r.player}/>
+      <p className="text-xs text-gray-400">Dynasty Score is {dynastyScore(r.player)}/100 — {dynastyScore(r.player)>=70?"elite dynasty asset":dynastyScore(r.player)>=50?"solid dynasty piece":dynastyScore(r.player)>=35?"moderate value — age or production is limiting":"low current dynasty value"}.</p>
+    </div>
+  );
+
+  /* ── playerList ── */
+  if (r.type === "playerList") return (
+    <div className="space-y-2">
+      <p className="text-xs text-gray-500 font-medium">{r.title || "Players found:"}</p>
+      {r.players.map(function(p){ return <AdvisorPlayerChip key={p.id||p.name} player={p}/>; })}
+    </div>
+  );
+
+  /* ── startSit ── */
+  if (r.type === "startSit") return (
+    <div className="space-y-2">
+      <div className={"rounded-xl border px-4 py-3 text-sm font-bold "+(r.rec.name===r.p1.name?"bg-green-50 border-green-200 text-green-800":"bg-green-50 border-green-200 text-green-800")}>
+        ✅ Start <span className="underline">{r.rec.name}</span>
+      </div>
+      <p className="text-xs text-gray-600">{r.reason}</p>
+      <div className="grid grid-cols-2 gap-2">
+        <AdvisorPlayerChip player={r.p1}/>
+        <AdvisorPlayerChip player={r.p2}/>
+      </div>
+    </div>
+  );
+
+  /* ── startAdvice ── */
+  if (r.type === "startAdvice") {
+    var svColor = r.verdict.startsWith("Start") && !r.verdict.includes("spot") ? "bg-green-50 border-green-200 text-green-800"
+                : r.verdict.startsWith("Spot") ? "bg-amber-50 border-amber-200 text-amber-800"
+                : "bg-orange-50 border-orange-200 text-orange-800";
+    return (
+      <div className="space-y-2">
+        <div className={"rounded-xl border px-4 py-3 text-sm font-bold "+svColor}>{r.verdict}</div>
+        <AdvisorPlayerChip player={r.player}/>
+      </div>
+    );
+  }
+
+  /* ── dynastyAdvice ── */
+  if (r.type === "dynastyAdvice") return (
+    <div className="space-y-2">
+      <p className="text-xs text-gray-500 font-medium">Dynasty outlook:</p>
+      {r.players.map(function(p){
+        var ds4 = dynastyScore(p);
+        var tier4 = ageTier(p.age||25);
+        return (
+          <div key={p.id||p.name}>
+            <AdvisorPlayerChip player={p}/>
+            <p className="text-xs text-gray-500 mt-1 ml-1">
+              {ds4>=70?"🔥 Elite dynasty asset — hold long term.":
+               ds4>=55?"📈 Strong dynasty piece — start/hold.":
+               ds4>=40?"⚖️ Moderate dynasty value. Age "+p.age+" puts them in the "+tier4.label+" tier.":
+               "📉 Low dynasty value at age "+(p.age||"?")+" — evaluate trade options."}
+            </p>
+          </div>
+        );
+      })}
+    </div>
+  );
+
+  /* ── tradeAdvice ── */
+  if (r.type === "tradeAdvice") return (
+    <div className="space-y-2">
+      <div className="bg-blue-50 border border-blue-200 rounded-xl px-4 py-3 text-sm font-bold text-blue-800">⚖️ {r.rec}</div>
+      <div className="grid grid-cols-2 gap-2">
+        <AdvisorPlayerChip player={r.p1}/>
+        <AdvisorPlayerChip player={r.p2}/>
+      </div>
+      <p className="text-xs text-gray-500">Combined scores — {r.p1.name}: <strong>{r.s1}</strong> · {r.p2.name}: <strong>{r.s2}</strong> (production + dynasty weighted)</p>
+    </div>
+  );
+
+  /* ── dropAdvice ── */
+  if (r.type === "dropAdvice") return (
+    <div className="space-y-2">
+      <p className="text-xs text-gray-500 font-medium">Lowest-value active players — consider dropping:</p>
+      {r.players.map(function(p){ return <AdvisorPlayerChip key={p.id||p.name} player={p}/>; })}
+      <p className="text-xs text-gray-400">Sorted by combined dynasty + fantasy production score. Always weigh positional scarcity before cutting.</p>
+    </div>
+  );
+
+  /* ── pickupAdvice ── */
+  if (r.type === "pickupAdvice") return (
+    <div className="space-y-2">
+      <p className="text-xs text-gray-500 font-medium">Top available pickups (by team fit + dynasty score):</p>
+      {r.players.map(function(p){ return <AdvisorPlayerChip key={p.id||p.name} player={p}/>; })}
+      <p className="text-xs text-gray-400">Based on loaded player directory. Go to FA Analyzer for full ranked list with FAAB guidance.</p>
+    </div>
+  );
+
+  /* ── lineupAdvice ── */
+  if (r.type === "lineupAdvice") return (
+    <div className="space-y-3">
+      <div>
+        <p className="text-xs font-semibold text-gray-500 mb-1.5">🏏 Start these hitters (by FP/G):</p>
+        <div className="space-y-1.5">{r.hitters.map(function(p){ return <AdvisorPlayerChip key={p.id||p.name} player={p}/>; })}</div>
+      </div>
+      <div>
+        <p className="text-xs font-semibold text-gray-500 mb-1.5">⚾ Start these pitchers (by FP/G):</p>
+        <div className="space-y-1.5">{r.pitchers.map(function(p){ return <AdvisorPlayerChip key={p.id||p.name} player={p}/>; })}</div>
+      </div>
+      <p className="text-xs text-gray-400">Rankings based on season FP/G. Always check matchups, weather, and IL status before locking your lineup.</p>
+    </div>
+  );
+
+  /* ── rosterAnalysis ── */
+  if (r.type === "rosterAnalysis") {
+    var critical5 = r.needs.filter(function(n){ return n.severity==="critical"; });
+    var moderate5 = r.needs.filter(function(n){ return n.severity==="moderate"; });
+    return (
+      <div className="space-y-3">
+        {critical5.length > 0 ? (
+          <div className="bg-red-50 border border-red-200 rounded-xl p-3">
+            <p className="text-xs font-bold text-red-700 mb-1.5">🚨 Critical needs ({critical5.length}):</p>
+            {critical5.map(function(n){ return <p key={n.label} className="text-xs text-red-600">• {n.label}: {n.note}</p>; })}
+          </div>
+        ) : <div className="bg-green-50 border border-green-200 rounded-xl p-3 text-xs text-green-700">✅ No critical position gaps detected.</div>}
+        {moderate5.length > 0 && (
+          <div className="bg-amber-50 border border-amber-100 rounded-xl p-3">
+            <p className="text-xs font-bold text-amber-700 mb-1.5">⚠ Moderate concerns ({moderate5.length}):</p>
+            {moderate5.map(function(n){ return <p key={n.label} className="text-xs text-amber-600">• {n.label}: {n.note}</p>; })}
+          </div>
+        )}
+        <div>
+          <p className="text-xs font-semibold text-gray-500 mb-1.5">💪 Your top active players:</p>
+          <div className="space-y-1.5">{r.strengths.map(function(p){ return <AdvisorPlayerChip key={p.id||p.name} player={p}/>; })}</div>
+        </div>
+      </div>
+    );
+  }
+
+  /* ── injuryInfo ── */
+  if (r.type === "injuryInfo") return (
+    <div className="space-y-2">
+      {r.player && <AdvisorPlayerChip player={r.player}/>}
+      {r.news && r.news.length > 0 ? (
+        <div className="space-y-1.5">
+          <p className="text-xs font-semibold text-gray-500">Recent injury news:</p>
+          {r.news.map(function(n,i){ return (
+            <div key={i} className="bg-red-50 border border-red-100 rounded-lg px-3 py-2">
+              <p className="text-xs font-semibold text-red-700">{n.headline}</p>
+              {n.description && <p className="text-xs text-red-500 mt-0.5 line-clamp-2">{n.description}</p>}
+              <p className="text-xs text-gray-400 mt-0.5">{n.source}</p>
+            </div>
+          ); })}
+        </div>
+      ) : <p className="text-xs text-gray-500">No injury news found in current feed.</p>}
+    </div>
+  );
+
+  /* ── noMatch ── */
+  if (r.type === "noMatch") return (
+    <div className="space-y-1">
+      <p className="text-sm text-gray-600">I'm not sure how to answer that. Try asking something like:</p>
+      <ul className="text-xs text-gray-400 space-y-0.5 list-disc list-inside">
+        <li>"Should I start Julio Rodriguez or Michael Harris?"</li>
+        <li>"Tell me about Marcelo Mayer"</li>
+        <li>"Who should I pick up this week?"</li>
+        <li>"Where is my roster weak?"</li>
+      </ul>
+    </div>
+  );
+
+  return <p className="text-sm text-gray-500">...</p>;
+}
+
+/* ── Quick suggestion chips shown at top of chat ── */
+var ADVISOR_QUICK = [
+  { label:"🏆 Top pickups",   q:"Who should I add this week?" },
+  { label:"📊 Roster needs",  q:"Where is my team weak?" },
+  { label:"📋 My lineup",     q:"Who should I start this week?" },
+  { label:"✂️ Who to drop",   q:"Who should I consider dropping?" },
+];
+
+function AdvisorTab({ roster, mlbDir, dirLoaded, dirLoading, onLoadDirectory, news, league }) {
+  var [messages, setMessages] = React.useState([
+    { role:"bot", response:{ type:"help" } }
+  ]);
+  var [input, setInput] = React.useState("");
+  var [thinking, setThinking] = React.useState(false);
+  var bottomRef = React.useRef(null);
+  var inputRef  = React.useRef(null);
+
+  React.useEffect(function() {
+    if (bottomRef.current) bottomRef.current.scrollIntoView({ behavior:"smooth" });
+  }, [messages]);
+
+  function sendQuery(text) {
+    var q = (text || input).trim();
+    if (!q) return;
+    setInput("");
+    setMessages(function(prev) { return prev.concat([{ role:"user", text:q }]); });
+    setThinking(true);
+    // Small delay to simulate "thinking"
+    setTimeout(function() {
+      var response = processAdvisorQuery(q, roster, mlbDir, news, league);
+      setMessages(function(prev) { return prev.concat([{ role:"bot", response:response }]); });
+      setThinking(false);
+    }, 420);
+  }
+
+  function handleKey(e) {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendQuery(); }
+  }
+
+  return (
+    <div className="flex flex-col" style={{height:"78vh"}}>
+      {/* Header */}
+      <div className="bg-gradient-to-r from-slate-900 to-blue-900 text-white px-5 py-3 rounded-t-2xl flex items-center justify-between">
+        <div>
+          <div className="font-black text-base">🤖 Dynasty Advisor</div>
+          <div className="text-slate-300 text-xs mt-0.5">Ask me anything about your lineup, roster, or any player at any level</div>
+        </div>
+        <div className="flex items-center gap-2">
+          {!dirLoaded && (
+            <button onClick={onLoadDirectory} disabled={dirLoading}
+              className="text-xs bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-semibold px-3 py-1.5 rounded-lg transition-colors">
+              {dirLoading ? "⏳ Loading..." : "🌐 Load Players"}
+            </button>
+          )}
+          {dirLoaded && <span className="text-xs text-emerald-400 font-medium">✓ {mlbDir.length.toLocaleString()} players loaded</span>}
+        </div>
+      </div>
+
+      {/* Quick actions */}
+      <div className="bg-slate-50 border-b border-slate-200 px-4 py-2 flex gap-2 flex-wrap">
+        {ADVISOR_QUICK.map(function(chip) {
+          return (
+            <button key={chip.q} onClick={function(){ sendQuery(chip.q); }}
+              className="text-xs bg-white border border-slate-200 hover:bg-blue-50 hover:border-blue-300 text-slate-600 font-medium px-3 py-1.5 rounded-full transition-colors shadow-sm">
+              {chip.label}
+            </button>
+          );
+        })}
+        {!roster && (
+          <span className="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-full px-3 py-1.5">
+            ⚠ Import roster CSV for personalized advice
+          </span>
+        )}
+      </div>
+
+      {/* Messages */}
+      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4 bg-white">
+        {messages.map(function(msg, i) {
+          if (msg.role === "user") return (
+            <div key={i} className="flex justify-end">
+              <div className="bg-blue-600 text-white text-sm rounded-2xl rounded-tr-sm px-4 py-2.5 max-w-xs shadow-sm">
+                {msg.text}
+              </div>
+            </div>
+          );
+          return (
+            <div key={i} className="flex justify-start gap-2.5">
+              <div className="w-8 h-8 bg-slate-800 rounded-full flex items-center justify-center text-base shrink-0 mt-0.5">🤖</div>
+              <div className="bg-slate-50 border border-slate-200 rounded-2xl rounded-tl-sm px-4 py-3 max-w-2xl w-full shadow-sm">
+                <AdvisorBotMessage msg={msg}/>
+              </div>
+            </div>
+          );
+        })}
+        {thinking && (
+          <div className="flex justify-start gap-2.5">
+            <div className="w-8 h-8 bg-slate-800 rounded-full flex items-center justify-center text-base shrink-0">🤖</div>
+            <div className="bg-slate-50 border border-slate-200 rounded-2xl rounded-tl-sm px-4 py-3 shadow-sm">
+              <div className="flex gap-1.5 items-center h-5">
+                <div className="w-2 h-2 bg-slate-400 rounded-full animate-bounce" style={{animationDelay:"0ms"}}/>
+                <div className="w-2 h-2 bg-slate-400 rounded-full animate-bounce" style={{animationDelay:"150ms"}}/>
+                <div className="w-2 h-2 bg-slate-400 rounded-full animate-bounce" style={{animationDelay:"300ms"}}/>
+              </div>
+            </div>
+          </div>
+        )}
+        <div ref={bottomRef}/>
+      </div>
+
+      {/* Input */}
+      <div className="bg-white border-t border-slate-200 px-4 py-3 rounded-b-2xl flex gap-2">
+        <input
+          ref={inputRef}
+          type="text"
+          value={input}
+          onChange={function(e){ setInput(e.target.value); }}
+          onKeyDown={handleKey}
+          placeholder="Ask about any player, lineup decision, pickup, or dynasty value..."
+          className="flex-1 border border-slate-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 bg-slate-50"
+        />
+        <button
+          onClick={function(){ sendQuery(); }}
+          disabled={!input.trim() || thinking}
+          className="bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white font-bold px-4 py-2.5 rounded-xl transition-colors text-sm">
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════
    ONBOARDING MODAL  — mandatory first-run walkthrough
    ═══════════════════════════════════════════════════════════════ */
 function OnboardingModal({ leagueName, onRosterFile, roster, onFaFile, onComplete }) {
@@ -4124,6 +4698,7 @@ function App() {
             ["roster",      roster ? `👥 Roster (${counts.total})`     : "👥 Roster"],
             ["fa",          "🔍 FA Analyzer"],
             ["trade",       "⚖️ Trade"],
+            ["advisor",     "🤖 Advisor"],
             ["news",        news.filter(function(n){return n.severity==="critical";}).length > 0 ? ("📰 News 🚑" + news.filter(function(n){return n.severity==="critical";}).length) : "📰 News"],
           ].map(([id,label])=>(
             <button key={id} onClick={()=>setTab(id)}
@@ -4263,6 +4838,18 @@ function App() {
             dirLoaded={dirLoaded}
             dirError={dirError}
             onLoadDirectory={loadDirectory}
+          />
+        )}
+
+        {tab==="advisor" && (
+          <AdvisorTab
+            roster={roster}
+            league={league}
+            mlbDir={mlbDir}
+            dirLoaded={dirLoaded}
+            dirLoading={dirLoading}
+            onLoadDirectory={loadDirectory}
+            news={news}
           />
         )}
 
