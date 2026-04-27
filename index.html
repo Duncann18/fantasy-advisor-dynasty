@@ -5,14 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Fantasy Roster Advisor ⚾</title>
 
-  <!--
-    Security headers (CSP, HSTS, X-Frame-Options, etc.) are set via the
-    _headers file and netlify.toml — those HTTP response headers are
-    stronger than meta tags and cover the full Netlify deployment.
-  -->
-
-  <!-- Referrer policy fallback (also set in _headers via HTTP header) -->
+  <!-- Referrer policy -->
   <meta name="referrer" content="strict-origin-when-cross-origin" />
+
+  <!-- Content Security Policy — allows Firebase, Google Auth, and all data sources -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.tailwindcss.com https://unpkg.com https://www.gstatic.com; connect-src 'self' https://unpkg.com https://www.gstatic.com https://cdn.tailwindcss.com https://firestore.googleapis.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://www.googleapis.com https://accounts.google.com https://*.firebaseio.com https://*.firebase.google.com https://statsapi.mlb.com https://site.api.espn.com https://api.rss2json.com https://nitter.privacydev.net https://bleacherreport.com https://blogs.fangraphs.com https://mlb.nbcsports.com https://sports.yahoo.com https://www.cbssports.com https://www.mlb.com https://www.rotowire.com; style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://www.gstatic.com; img-src 'self' data: https:; font-src 'self' data: https: https://www.gstatic.com; object-src 'none'; base-uri 'self'; form-action 'self'; frame-src https://accounts.google.com https://*.firebaseapp.com;" />
 
   <!--
     CDN DEPENDENCIES — pinned to exact versions

@@ -1,4 +1,4 @@
-# Netlify HTTP Response Headers — applied to every page on the site
+# Netlify HTTP Response Headers
 
 /*
   X-Frame-Options: DENY
@@ -7,4 +7,3 @@
   Strict-Transport-Security: max-age=31536000; includeSubDomains
   Referrer-Policy: strict-origin-when-cross-origin
   Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=()
-  Content-Security-Policy: default-src 'none'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.tailwindcss.com https://unpkg.com https://www.gstatic.com; connect-src 'self' https://unpkg.com https://www.gstatic.com https://statsapi.mlb.com https://site.api.espn.com https://api.rss2json.com https://nitter.privacydev.net https://bleacherreport.com https://blogs.fangraphs.com https://mlb.nbcsports.com https://sports.yahoo.com https://www.cbssports.com https://www.mlb.com https://www.rotowire.com https://firestore.googleapis.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://www.googleapis.com https://accounts.google.com https://*.firebaseio.com https://*.firebase.google.com; style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; img-src 'self' data: https:; font-src 'self' data: https:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-src https://accounts.google.com https://*.firebaseapp.com; frame-ancestors 'none';
