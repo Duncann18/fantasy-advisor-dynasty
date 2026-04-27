@@ -4,10 +4,35 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Fantasy Roster Advisor ⚾</title>
+
+  <!--
+    Security headers (CSP, HSTS, X-Frame-Options, etc.) are set via the
+    _headers file and netlify.toml — those HTTP response headers are
+    stronger than meta tags and cover the full Netlify deployment.
+  -->
+
+  <!-- Referrer policy fallback (also set in _headers via HTTP header) -->
+  <meta name="referrer" content="strict-origin-when-cross-origin" />
+
+  <!--
+    CDN DEPENDENCIES — pinned to exact versions
+    ─────────────────────────────────────────────────────────────────────────
+    Pinning prevents unexpected breaking changes from floating semver ranges.
+    To add SRI hash protection, run this one-liner after any version update:
+      node -e "const c=require('crypto'),fs=require('fs');
+        const d=fs.readFileSync('file.js');
+        console.log('sha384-'+c.createHash('sha384').update(d).digest('base64'));"
+    Then add integrity="sha384-<hash>" crossorigin="anonymous" to each tag.
+
+    Tailwind Play CDN is intentionally excluded from SRI because it generates
+    CSS dynamically (the response varies per page) — use a proper Tailwind
+    build step for SRI on styles.
+  -->
   <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
-  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://unpkg.com/react@18.2.0/umd/react.production.min.js" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.23.5/babel.min.js" crossorigin="anonymous"></script>
+
   <style>
     body { font-family: system-ui, -apple-system, sans-serif; margin: 0; }
     * { box-sizing: border-box; }
@@ -228,6 +253,14 @@ function parseFantraxFACSV(text) {
 /* ═══════════════════════════════════════════════════════════════
    DYNASTY SCORING
    ═══════════════════════════════════════════════════════════════ */
+// Sanitize external URLs — only allow http/https to prevent javascript: injection
+function safeHref(url) {
+  if (!url || typeof url !== "string") return null;
+  var trimmed = url.trim();
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  return null; // reject everything else (javascript:, data:, vbscript:, etc.)
+}
+
 function ageTier(age) {
   return DYNASTY_AGE.find(t => age <= t.max) || DYNASTY_AGE[DYNASTY_AGE.length-1];
 }
@@ -623,6 +656,211 @@ function generateSuggestions(hitters, pitchers) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
+   NEWS + DIFFERENTIALS ENGINE
+   ═══════════════════════════════════════════════════════════════ */
+
+// Return news items that mention a specific roster player (by last name / full name)
+function newsForPlayer(player, newsArr) {
+  if (!newsArr || !newsArr.length || !player) return [];
+  var nl = player.name.toLowerCase();
+  var last = nl.split(" ").slice(-1)[0];
+  return newsArr.filter(function(n) {
+    var hl = (n.headline || "").toLowerCase();
+    var desc = (n.description || "").toLowerCase();
+    var pn = (n.playerName || "").toLowerCase();
+    return pn === nl ||
+           hl.includes(nl) ||
+           (last.length >= 5 && (hl.includes(last) || desc.includes(last)));
+  });
+}
+
+// Return news items relevant to any player on the roster (injuries + transactions)
+function rosterNewsAlerts(roster, newsArr) {
+  if (!roster || !newsArr || !newsArr.length) return [];
+  var rosterNames = new Set(roster.all.map(function(p) { return p.name.toLowerCase(); }));
+  var rosterLasts = roster.all
+    .filter(function(p) { return p.name.split(" ").slice(-1)[0].length >= 5; })
+    .map(function(p) { return p.name.split(" ").slice(-1)[0].toLowerCase(); });
+
+  return newsArr.filter(function(n) {
+    var hl  = (n.headline || "").toLowerCase();
+    var pn  = (n.playerName || "").toLowerCase();
+    if (pn && rosterNames.has(pn)) return true;
+    for (var i = 0; i < rosterLasts.length; i++) {
+      if (hl.includes(rosterLasts[i])) return true;
+    }
+    return false;
+  }).slice(0, 8);
+}
+
+// Classify a single news item into a signal type
+function newsSignalType(n) {
+  var hl = (n.headline || "").toLowerCase();
+  var desc = (n.description || "").toLowerCase();
+  var text = hl + " " + desc;
+  if (/recalled|call[- ]?up|called up|promoted|promotion/.test(text)) return "callup";
+  if (/activated|returns? from|off the il|cleared to|reinstated/.test(text)) return "return";
+  if (/closer|saves role|closing|9th inning|save opportunit/.test(text)) return "role";
+  if (/hot streak|walk.off|multi.homer|cycle|grand slam|no.hitter|perfect game/.test(text)) return "hot";
+  if (/injur|placed on|day.to.day|il|disabled list|hurt|fracture|strain|sprain|surgery/.test(text)) return "injury";
+  if (/suspend|suspension/.test(text)) return "suspend";
+  if (/trade|traded|acquired|signed|designated for assignment|dfa/.test(text)) return "transaction";
+  return "general";
+}
+
+// Player-scoped signal classifier — looks only at sentences mentioning the specific player
+// so multi-player headlines don't bleed signal across players (e.g. "Lindor exits" doesn't
+// tag a Vientos hit as an injury).
+function newsSignalTypeForPlayer(n, playerName) {
+  if (!playerName) return newsSignalType(n);
+  var nl   = playerName.toLowerCase();
+  var last = nl.split(" ").slice(-1)[0];
+  var allText = (n.headline || "") + ". " + (n.description || "");
+  // split on sentence boundaries
+  var sentences = allText.split(/[.!?]+/).filter(function(s) { return s.trim().length > 0; });
+  // keep only sentences that reference this player
+  var playerSentences = sentences.filter(function(s) {
+    var sl = s.toLowerCase();
+    return sl.includes(nl) || (last.length >= 5 && sl.includes(last));
+  });
+  if (playerSentences.length > 0) {
+    // classify against only the player's sentences
+    return newsSignalType({ headline: playerSentences.join(". "), description: "" });
+  }
+  // fallback: classify the whole item
+  return newsSignalType(n);
+}
+
+// Generate differentials — always produces content from roster data, news is a bonus layer
+function generateDifferentials(roster, newsArr, mlbDir) {
+  if (!roster) return [];
+  var diffs = [];
+  var all = roster.all;
+  var news = newsArr || [];
+
+  // Helper: find any non-injury news for a player
+  function positiveNews(p) {
+    return newsForPlayer(p, news).filter(function(n) {
+      var sig = newsSignalTypeForPlayer(n, p.name);
+      return sig !== "injury" && sig !== "suspend";
+    });
+  }
+
+  // ── 1. Bench Bombs: top reserve players by dynasty score (no age/score gate) ──
+  var reserve = all
+    .filter(function(p) { return p.status === "Res"; })
+    .sort(function(a, b) { return dynastyScore(b) - dynastyScore(a); })
+    .slice(0, 3);
+
+  reserve.forEach(function(p) {
+    var ds = dynastyScore(p);
+    var pn = positiveNews(p);
+    var upside = ds >= 70 ? "Extreme" : ds >= 50 ? "High" : "Moderate";
+    var risk   = pn.length ? "Medium" : "High";
+    diffs.push({
+      id: "bench-" + p.id,
+      type: "bench_bomb",
+      player: p,
+      label: "Bench Bomb",
+      emoji: "💣",
+      riskColor: "bg-amber-100 border-amber-300 text-amber-900",
+      badgeColor: "bg-amber-500 text-white",
+      rationale: pn.length
+        ? p.name + " (Dynasty Score " + ds + ", Age " + (p.age || "?") + ") has fresh news and is sitting on your bench. This is a high-upside activation candidate right now."
+        : p.name + " (Dynasty Score " + ds + ", Age " + (p.age || "?") + ") is your highest-value bench player. If their MLB team needs them or matchups line up, activating them could win you the week.",
+      news: pn.slice(0, 1),
+      upside: upside,
+      risk: risk,
+    });
+  });
+
+  // ── 2. IL Return Plays: ALL players on IR — no news/fpAvg gate ──
+  var irPlayers = all.filter(function(p) { return p.status === "IR"; });
+  irPlayers.slice(0, 3).forEach(function(p) {
+    var ds = dynastyScore(p);
+    var pn = positiveNews(p);
+    var fpStr = p.fpAvg > 0 ? p.fpAvg.toFixed(1) + " FP/G before IL" : "on your roster for a reason";
+    diffs.push({
+      id: "return-" + p.id,
+      type: "il_return",
+      player: p,
+      label: "IL Return Play",
+      emoji: "🔄",
+      riskColor: "bg-blue-50 border-blue-300 text-blue-900",
+      badgeColor: "bg-blue-500 text-white",
+      rationale: pn.length
+        ? p.name + " has news — a return may be imminent. Clear bench space now so you're not scrambling when they're activated."
+        : p.name + " (" + fpStr + ") is on IL. Monitor their timeline — getting them back healthy could be the difference-maker in a close week.",
+      news: pn.slice(0, 1),
+      upside: p.fpAvg >= 8 ? "Extreme" : "High",
+      risk: "Medium",
+    });
+  });
+
+  // ── 3. Prospect Watch: top minors players by dynasty score (always shown) ──
+  var minors = all
+    .filter(function(p) { return p.status === "Min"; })
+    .sort(function(a, b) { return dynastyScore(b) - dynastyScore(a); })
+    .slice(0, 2);
+
+  minors.forEach(function(p) {
+    var ds = dynastyScore(p);
+    var pn = positiveNews(p);
+    var isCallup = pn.some(function(n) { return newsSignalTypeForPlayer(n, p.name) === "callup"; });
+    diffs.push({
+      id: "prospect-" + p.id,
+      type: "prospect_watch",
+      player: p,
+      label: isCallup ? "Prospect Call-Up 🚀" : "Prospect Watch",
+      emoji: isCallup ? "🚀" : "💎",
+      riskColor: "bg-purple-50 border-purple-300 text-purple-900",
+      badgeColor: "bg-purple-600 text-white",
+      rationale: isCallup
+        ? p.name + " has call-up news! Clear a spot on your active roster immediately — you don't want to be caught with them in minors when they arrive."
+        : p.name + " (Dynasty Score " + ds + ") is your highest-value minors player. Watch for promotion news — when it comes you want to react before the waiver window closes.",
+      news: pn.slice(0, 1),
+      upside: ds >= 65 ? "Extreme" : "High",
+      risk: isCallup ? "Low" : "Medium",
+    });
+  });
+
+  // ── 4. News-driven signals: role upgrades or positive news for any roster player ──
+  var newsSeen = new Set();
+  news.forEach(function(n) {
+    var sig = newsSignalTypeForPlayer(n, n.playerName || null);
+    if (sig === "injury" || sig === "suspend" || sig === "general") return;
+    var pn2 = (n.playerName || "").toLowerCase();
+    if (newsSeen.has(pn2)) return;
+    var match = all.find(function(p) {
+      var nl = p.name.toLowerCase();
+      var last = nl.split(" ").slice(-1)[0];
+      return nl === pn2 || (last.length >= 5 && (n.headline || "").toLowerCase().includes(last));
+    });
+    if (!match || newsSeen.has(match.id)) return;
+    newsSeen.add(match.id);
+    var label = sig === "callup" ? "Called Up" : sig === "return" ? "IL Return" : sig === "role" ? "Role Change" : sig === "hot" ? "Hot Streak" : "Transaction";
+    var emoji  = sig === "callup" ? "🚀" : sig === "return" ? "🔄" : sig === "role" ? "⬆️" : sig === "hot" ? "🔥" : "🔁";
+    var rc     = sig === "role" ? "bg-emerald-50 border-emerald-300 text-emerald-900" : "bg-orange-50 border-orange-300 text-orange-900";
+    var bc     = sig === "role" ? "bg-emerald-600 text-white" : "bg-orange-500 text-white";
+    diffs.push({
+      id: "news-" + match.id,
+      type: sig,
+      player: match,
+      label: label,
+      emoji: emoji,
+      riskColor: rc,
+      badgeColor: bc,
+      rationale: n.headline + " — Act on this signal before the rest of the league does.",
+      news: [n],
+      upside: "High",
+      risk: sig === "hot" ? "Low" : "Medium",
+    });
+  });
+
+  return diffs.slice(0, 7);
+}
+
+/* ═══════════════════════════════════════════════════════════════
    UI HELPERS
    ═══════════════════════════════════════════════════════════════ */
 const PRIORITY_CARD  = { critical:"border-l-4 border-red-500 bg-red-50", high:"border-l-4 border-orange-400 bg-orange-50", medium:"border-l-4 border-yellow-400 bg-yellow-50", low:"border-l-4 border-gray-300 bg-gray-50" };
@@ -731,6 +969,247 @@ function PlayerMini({ player, label, accent }) {
         <div className="flex items-center gap-1">Avg/gm: <AvgBar avg={player.fpAvg} pos={player.pos} type={player.type}/></div>
         <div>Total: <strong>{player.fpTotal.toFixed(1)} pts</strong> · {player.gp} GP · Age {player.age}</div>
         <div className="flex items-center gap-1"><Stars n={tier.stars}/><span className={`text-xs ${tier.color}`}>{tier.label}</span></div>
+      </div>
+    </div>
+  );
+}
+
+/* ── Roster News Alert strip ── */
+function RosterNewsStrip({ roster, news }) {
+  var alerts = rosterNewsAlerts(roster, news);
+  if (!alerts.length) return null;
+
+  var sig2color = { injury:"bg-red-500", suspend:"bg-red-400", callup:"bg-emerald-500", return:"bg-blue-500", role:"bg-purple-500", hot:"bg-orange-500", transaction:"bg-slate-500", general:"bg-gray-500" };
+  var sig2label = { injury:"🚑 Injury", suspend:"🚫 Suspended", callup:"🚀 Called Up", return:"🔄 Return", role:"⬆️ Role Change", hot:"🔥 Hot Streak", transaction:"🔁 Transaction", general:"📰 News" };
+
+  // Find the roster player(s) mentioned in a news item
+  function matchedPlayers(n) {
+    if (!roster) return [];
+    var pn  = (n.playerName || "").toLowerCase();
+    var hl  = (n.headline || "").toLowerCase();
+    var desc= (n.description || "").toLowerCase();
+    var matched = [];
+    roster.all.forEach(function(p) {
+      var nl   = p.name.toLowerCase();
+      var last = nl.split(" ").slice(-1)[0];
+      if (
+        (pn && nl === pn) ||
+        hl.includes(nl) ||
+        desc.includes(nl) ||
+        (last.length >= 5 && (hl.includes(last) || desc.includes(last)))
+      ) {
+        matched.push(p);
+      }
+    });
+    // deduplicate by name
+    var seen = new Set();
+    return matched.filter(function(p) {
+      if (seen.has(p.name)) return false;
+      seen.add(p.name); return true;
+    });
+  }
+
+  // Pull the most relevant sentence from the description for a player name
+  function relevantSnippet(text, playerName) {
+    if (!text || !playerName) return text || "";
+    var last = playerName.split(" ").slice(-1)[0].toLowerCase();
+    var sentences = text.split(/(?<=[.!?])\s+/);
+    // Try to find a sentence that contains the last name
+    var hit = sentences.find(function(s) { return s.toLowerCase().includes(last); });
+    return hit || sentences[0] || text;
+  }
+
+  return (
+    <div className="bg-slate-900 rounded-xl p-4 mb-5">
+      <div className="flex items-center gap-2 mb-3">
+        <span className="text-base">📡</span>
+        <h3 className="text-white font-bold text-sm">Live Roster News</h3>
+        <span className="text-slate-400 text-xs">{alerts.length} update{alerts.length !== 1 ? "s" : ""} on your players</span>
+      </div>
+      <div className="space-y-2">
+        {alerts.map(function(n, i) {
+          var safeLink = safeHref(n.link);
+          var hasLink  = !!safeLink;
+          var players  = matchedPlayers(n);
+          // Use player-scoped classifier so multi-player headlines don't bleed signals
+          var sig      = newsSignalTypeForPlayer(n, players.length > 0 ? players[0].name : null);
+          var badgeCls = sig2color[sig] || "bg-gray-500";
+          var badgeLbl = sig2label[sig] || "📰 News";
+          return (
+            <div key={i} className="bg-slate-800 rounded-lg px-3 py-3">
+              {/* Top row: badge + player chips + source */}
+              <div className="flex items-center gap-2 flex-wrap mb-1.5">
+                <span className={"text-xs font-bold px-2 py-0.5 rounded-full text-white shrink-0 " + badgeCls}>{badgeLbl}</span>
+                {players.map(function(p) {
+                  return (
+                    <span key={p.name} className="flex items-center gap-1 bg-slate-700 rounded-full pl-1.5 pr-2 py-0.5">
+                      <span className={"text-xs font-bold px-1 py-0 rounded-full " + posColor(p.pos)}>{p.pos}</span>
+                      <span className="text-xs font-semibold text-white">{p.name}</span>
+                    </span>
+                  );
+                })}
+                <span className="text-xs text-slate-500 ml-auto shrink-0">{n.source}</span>
+              </div>
+              {/* Headline */}
+              <div className="min-w-0">
+                {hasLink
+                  ? <a href={safeLink} target="_blank" rel="noopener noreferrer"
+                      className="text-xs font-semibold text-white hover:text-blue-300 transition-colors leading-snug">
+                      {players.length > 0
+                        ? <HighlightedText text={n.headline} name={players[0].name}/>
+                        : n.headline}
+                      {" "}<span className="text-slate-500">↗</span>
+                    </a>
+                  : <p className="text-xs font-semibold text-white leading-snug">
+                      {players.length > 0
+                        ? <HighlightedText text={n.headline} name={players[0].name}/>
+                        : n.headline}
+                    </p>}
+              </div>
+              {/* Relevant description snippet with name highlighted */}
+              {n.description && players.length > 0 && (
+                <p className="text-xs text-slate-400 mt-1 leading-relaxed">
+                  <HighlightedText
+                    text={relevantSnippet(n.description, players[0].name)}
+                    name={players[0].name}
+                  />
+                </p>
+              )}
+              {n.description && players.length === 0 && (
+                <p className="text-xs text-slate-400 mt-1 leading-relaxed line-clamp-2">{n.description}</p>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ── Differential Card ── */
+function DifferentialCard({ diff }) {
+  var [open, setOpen] = React.useState(false);
+  var ds = dynastyScore(diff.player);
+  var tier = ageTier(diff.player.age || 25);
+  return (
+    <div className={"rounded-xl border-2 overflow-hidden " + diff.riskColor}>
+      <div className="px-4 py-3 cursor-pointer select-none" onClick={function() { setOpen(function(o) { return !o; }); }}>
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex items-start gap-2.5 flex-1 min-w-0">
+            <span className="text-lg shrink-0 mt-0.5">{diff.emoji}</span>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 flex-wrap mb-0.5">
+                <span className={"text-xs font-bold px-2 py-0.5 rounded-full " + diff.badgeColor}>{diff.label}</span>
+                <span className={"text-xs font-bold px-2 py-0.5 rounded-full " + posColor(diff.player.pos)}>{diff.player.pos}</span>
+                <span className="text-xs font-bold text-gray-700">{diff.player.name}</span>
+                <span className="text-xs text-gray-500">{diff.player.team}</span>
+              </div>
+              <div className="flex items-center gap-3 text-xs flex-wrap">
+                <span className={"font-semibold " + tier.color}>{tier.label}</span>
+                <span className="text-gray-500">DS {ds}</span>
+                {diff.player.fpAvg > 0 && <span className="text-gray-500">{diff.player.fpAvg.toFixed(1)} FP/G</span>}
+                <span className={"px-1.5 py-0.5 rounded text-xs font-semibold " + (diff.risk === "Low" ? "bg-green-100 text-green-700" : diff.risk === "Medium" ? "bg-amber-100 text-amber-700" : "bg-red-100 text-red-700")}>Risk: {diff.risk}</span>
+                <span className={"px-1.5 py-0.5 rounded text-xs font-semibold " + (diff.upside === "Extreme" ? "bg-purple-100 text-purple-700" : "bg-blue-100 text-blue-700")}>Upside: {diff.upside}</span>
+              </div>
+            </div>
+          </div>
+          <span className="text-gray-400 text-xs shrink-0 mt-1">{open ? "▲" : "▼"}</span>
+        </div>
+      </div>
+      {open && (
+        <div className="px-4 pb-4 pt-0 border-t border-black/10">
+          <p className="text-xs leading-relaxed mt-3 mb-2" style={{color:"inherit", opacity:0.85}}>{diff.rationale}</p>
+          {diff.news && diff.news.length > 0 && diff.news.map(function(n, i) {
+            var diffSafeLink = safeHref(n.link);
+            return (
+              <div key={i} className="bg-white/60 rounded-lg px-3 py-2 mt-1.5">
+                {diffSafeLink
+                  ? <a href={diffSafeLink} target="_blank" rel="noopener noreferrer" className="text-xs font-semibold text-gray-800 hover:underline">{n.headline} ↗</a>
+                  : <p className="text-xs font-semibold text-gray-800">{n.headline}</p>}
+                <p className="text-xs text-gray-500 mt-0.5">{n.source}</p>
+              </div>
+            );
+          })}
+          <div className="mt-3 flex items-center gap-2 text-xs text-gray-500 bg-white/40 rounded-lg px-3 py-2">
+            <span className="font-semibold">⚠ Remember:</span> Differentials are high-ceiling picks that carry real bust risk. Only make this move if you can absorb a bad week.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ── Short-Term Insights: ALL roster news categorised, not just specific types ── */
+function ShortTermInsights({ roster, news }) {
+  if (!roster) return null;
+
+  var sig2badge = {
+    callup:      { color: "bg-emerald-100 border-emerald-300 text-emerald-800", icon: "🚀", label: "Call-Up"      },
+    return:      { color: "bg-blue-100 border-blue-300 text-blue-800",          icon: "🔄", label: "Return"       },
+    role:        { color: "bg-purple-100 border-purple-300 text-purple-800",    icon: "⬆️", label: "Role Change"  },
+    hot:         { color: "bg-orange-100 border-orange-300 text-orange-800",    icon: "🔥", label: "Hot"          },
+    transaction: { color: "bg-slate-100 border-slate-300 text-slate-800",       icon: "🔁", label: "Transaction"  },
+    injury:      { color: "bg-red-100 border-red-300 text-red-800",             icon: "🚑", label: "Injury"       },
+    suspend:     { color: "bg-red-100 border-red-300 text-red-800",             icon: "🚫", label: "Suspended"    },
+    general:     { color: "bg-gray-100 border-gray-300 text-gray-700",          icon: "📰", label: "News"         },
+  };
+
+  // Build a lookup of roster player last names (≥5 chars) for headline matching
+  var rosterNames = new Set(roster.all.map(function(p) { return p.name.toLowerCase(); }));
+  var rosterLasts = roster.all
+    .filter(function(p) { return p.name.split(" ").slice(-1)[0].length >= 5; })
+    .map(function(p) { return p.name.split(" ").slice(-1)[0].toLowerCase(); });
+
+  function isRosterNews(n) {
+    var pn = (n.playerName || "").toLowerCase();
+    var hl = (n.headline || "").toLowerCase();
+    if (pn && rosterNames.has(pn)) return true;
+    for (var i = 0; i < rosterLasts.length; i++) {
+      if (hl.includes(rosterLasts[i])) return true;
+    }
+    return false;
+  }
+
+  var seenHeads = new Set();
+  var signals = [];
+  (news || []).forEach(function(n) {
+    if (seenHeads.has(n.headline)) return;
+    if (!isRosterNews(n)) return;
+    seenHeads.add(n.headline);
+    var sig = newsSignalTypeForPlayer(n, n.playerName || null);
+    signals.push({ n: n, sig: sig, badge: sig2badge[sig] || sig2badge.general });
+  });
+
+  if (!signals.length) return null;
+
+  // Sort: positive signals first, then injuries/general
+  var order = { callup:0, return:1, role:2, hot:3, transaction:4, general:5, injury:6, suspend:7 };
+  signals.sort(function(a, b) { return (order[a.sig] || 5) - (order[b.sig] || 5); });
+
+  return (
+    <div className="mb-5">
+      <div className="flex items-center gap-2 mb-2.5">
+        <span className="text-base">⚡</span>
+        <h3 className="font-bold text-gray-800 text-sm">Short-Term Signals</h3>
+        <span className="text-xs text-gray-400">{signals.length} update{signals.length !== 1 ? "s" : ""} on your roster players</span>
+      </div>
+      <div className="flex gap-2.5 overflow-x-auto pb-1">
+        {signals.slice(0, 10).map(function(item, i) {
+          var stSafeLink = safeHref(item.n.link);
+          return (
+            <div key={i} className={"border rounded-xl px-3 py-2.5 shrink-0 max-w-xs " + item.badge.color} style={{minWidth:"200px"}}>
+              <div className="flex items-center gap-1.5 mb-1">
+                <span>{item.badge.icon}</span>
+                <span className="text-xs font-bold">{item.badge.label}</span>
+                <span className="text-xs opacity-50">{item.n.source}</span>
+              </div>
+              {stSafeLink
+                ? <a href={stSafeLink} target="_blank" rel="noopener noreferrer"
+                    className="text-xs font-semibold leading-snug hover:underline block line-clamp-3">{item.n.headline} ↗</a>
+                : <p className="text-xs font-semibold leading-snug line-clamp-3">{item.n.headline}</p>}
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -1165,6 +1644,24 @@ async function fetchPlayerNews(rosterPlayers) {
     return                               { typeCode: "news", severity: "info"     };
   }
 
+  // Player-scoped classifier: extract sentences mentioning the player before classifying,
+  // so a multi-player headline (e.g. "Lindor exits; Vientos hits tiebreaker") doesn't bleed
+  // Lindor's injury tag onto Vientos's card.
+  function classifyTextForPlayer(text, playerName) {
+    if (!playerName) return classifyText(text);
+    var nl   = playerName.toLowerCase();
+    var last = nl.split(" ").slice(-1)[0];
+    var sentences = text.split(/[.!?]+/).filter(function(s) { return s.trim().length > 0; });
+    var playerSentences = sentences.filter(function(s) {
+      var sl = s.toLowerCase();
+      return sl.indexOf(nl) >= 0 || (last.length >= 5 && sl.indexOf(last) >= 0);
+    });
+    if (playerSentences.length > 0) {
+      return classifyText(playerSentences.join(". "));
+    }
+    return classifyText(text);
+  }
+
   // ── 1. MLB Official Transactions (authoritative) ──────────────
   try {
     var txUrl  = MLB_API + "/transactions?startDate=" + isoDate(start) + "&endDate=" + isoDate(now) + "&sportId=1&limit=500";
@@ -1206,7 +1703,7 @@ async function fetchPlayerNews(rosterPlayers) {
         if (!rp2) continue;
         var pubDate = art.published ? new Date(art.published) : now;
         if (now - pubDate > 21 * 24 * 60 * 60 * 1000) continue;
-        var cls = classifyText(hl + " " + desc);
+        var cls = classifyTextForPlayer(hl + " " + desc, rp2.name);
         var espnLink = (art.links && art.links.web && art.links.web.href) ? art.links.web.href : (art.url || null);
         addItem({
           id: "espn-" + (art.dataSourceIdentifier || Math.random()),
@@ -1246,7 +1743,7 @@ async function fetchPlayerNews(rosterPlayers) {
 
       // Strip HTML tags from content for display
       var cleanContent = content.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 300);
-      var cls2 = classifyText(title + " " + content);
+      var cls2 = classifyTextForPlayer(title + " " + content, rp3.name);
 
       addItem({
         id: src.name.toLowerCase() + "-" + (item.guid || item.link || Math.random()),
@@ -1284,7 +1781,7 @@ async function fetchPlayerNews(rosterPlayers) {
       var xDate = xItem.pubDate ? new Date(xItem.pubDate) : now;
       if (isNaN(xDate.getTime())) xDate = now;
       if (now - xDate > 21 * 24 * 60 * 60 * 1000) continue;
-      var xCls = classifyText(xTitle + " " + xContent);
+      var xCls = classifyTextForPlayer(xTitle + " " + xContent, xRp.name);
       var xLink = xItem.link ? xItem.link.replace(NITTER_BASE, "https://x.com/") : null;
       addItem({
         id: "x-" + xAcct.handle + "-" + (xItem.guid || xItem.link || Math.random()),
@@ -1345,7 +1842,7 @@ function HighlightedText({ text, name }) {
 function NewsCard({ item }) {
   var meta = getTxMeta(item.typeCode);
   var dateStr = fmtNewsDate(item.date);
-  var hasLink = item.link && item.link.length > 0;
+  var cardSafeLink = safeHref(item.link);
   return (
     <div className={"rounded-xl border p-4 " + meta.color}>
       <div className="flex items-start gap-2.5">
@@ -1360,9 +1857,9 @@ function NewsCard({ item }) {
           </div>
 
           {/* Headline — clickable if link exists */}
-          {hasLink ? (
+          {cardSafeLink ? (
             <a
-              href={item.link}
+              href={cardSafeLink}
               target="_blank"
               rel="noopener noreferrer"
               className={"text-xs font-semibold leading-snug hover:underline flex items-start gap-1 group " + meta.text}
@@ -4744,24 +5241,66 @@ function App() {
 
         {tab==="suggestions" && roster && (
           <div>
-            <div className="grid grid-cols-3 gap-4 mb-6">
+            {/* ── Summary counters ── */}
+            <div className="grid grid-cols-3 gap-4 mb-5">
               {[
                 {label:"Critical moves",count:suggestions.filter(s=>s.priority==="critical").length,bar:"bg-red-500"},
                 {label:"High priority", count:suggestions.filter(s=>s.priority==="high").length,    bar:"bg-orange-400"},
                 {label:"Worth noting",  count:suggestions.filter(s=>["medium","low"].includes(s.priority)).length, bar:"bg-yellow-400"},
-              ].map(({label,count,bar})=>(
+              ].map(function({label,count,bar}){ return (
                 <div key={label} className="bg-white rounded-xl border shadow-sm p-4 text-center">
                   <div className={`text-3xl font-black ${count>0?"text-gray-800":"text-gray-300"}`}>{count}</div>
                   <div className="text-xs text-gray-500 mt-1">{label}</div>
                   {count>0&&<div className={`mt-2 h-1 rounded-full ${bar}`}/>}
                 </div>
-              ))}
+              ); })}
             </div>
-            {suggestions.length===0
-              ? <div className="bg-green-50 border border-green-200 rounded-xl p-10 text-center"><div className="text-4xl mb-2">✅</div><p className="font-semibold text-green-800">Roster looks clean — no obvious moves this week.</p></div>
-              : <div className="space-y-3">{suggestions.map(s=><SuggestionCard key={s.id} s={s}/>)}</div>
-            }
-            <div className="mt-6 bg-slate-800 text-white rounded-xl p-5">
+
+            {/* ── Live Roster News ── */}
+            <RosterNewsStrip roster={roster} news={news}/>
+
+            {/* ── Short-Term Signals ── */}
+            <ShortTermInsights roster={roster} news={news}/>
+
+            {/* ── System Suggestions ── */}
+            {suggestions.length > 0 && (
+              <div className="mb-6">
+                <div className="flex items-center gap-2 mb-2.5">
+                  <span className="text-base">🎯</span>
+                  <h3 className="font-bold text-gray-800 text-sm">Suggested Moves</h3>
+                </div>
+                <div className="space-y-3">{suggestions.map(function(s){ return <SuggestionCard key={s.id} s={s}/>; })}</div>
+              </div>
+            )}
+            {suggestions.length === 0 && (
+              <div className="bg-green-50 border border-green-200 rounded-xl p-8 text-center mb-6">
+                <div className="text-4xl mb-2">✅</div>
+                <p className="font-semibold text-green-800">Roster looks clean — no obvious swaps this week.</p>
+              </div>
+            )}
+
+            {/* ── Differentials ── */}
+            {(function() {
+              var diffs = generateDifferentials(roster, news, mlbDir);
+              if (!diffs.length) return null;
+              return (
+                <div className="mb-6">
+                  <div className="flex items-start gap-2 mb-3">
+                    <span className="text-xl">🎲</span>
+                    <div>
+                      <h3 className="font-bold text-gray-800 text-sm">Differentials</h3>
+                      <p className="text-xs text-gray-400 mt-0.5">High-ceiling plays that could swing your week — but carry real bust risk. Bet on these when you need the upside.</p>
+                    </div>
+                  </div>
+                  <div className="space-y-2.5">
+                    {diffs.map(function(d){ return <DifferentialCard key={d.id} diff={d}/>; })}
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* ── Week Limits ── */}
+            <div className="bg-slate-800 text-white rounded-xl p-5">
               <h3 className="font-bold text-xs mb-3 uppercase tracking-wide">Week Limits</h3>
               <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs text-slate-300">
                 <div><span className="text-white font-semibold">Max Starts:</span> {league.maxStarts}/week</div>
