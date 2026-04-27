@@ -91,6 +91,7 @@ var _auth = firebase.auth();
 const DEFAULT_LEAGUE = {
   name:          "Dynasty Field of Dreams S4",
   platform:      "Fantrax",
+  scoringFormat: "h2h_points",   // h2h_points | h2h_cats | roto | points
   scoring:       "H2H Points · Median (14 teams)",
   maxStarts:     10,         // max pitching starts per week
   maxSaves:      10,         // max saves per week
@@ -102,6 +103,21 @@ const DEFAULT_LEAGUE = {
   // FAAB bids processed: Sun, Mon, Wed at midnight EDT · Min bid $1
   // Trade deadline: Sep 27, 2026 · Lineup locks: Weekly every Monday
 };
+
+/* ── SCORING FORMATS ────────────────────────────────────────────
+   Used in SettingsPanel and to calibrate all insight engines.
+   ─────────────────────────────────────────────────────────────*/
+const SCORING_FORMATS = [
+  { id:"h2h_points", label:"H2H Points",        desc:"Weekly matchup by total fantasy points" },
+  { id:"h2h_cats",   label:"H2H Categories",     desc:"Weekly matchup across individual stat categories" },
+  { id:"roto",       label:"Rotisserie (Roto)",  desc:"Season-long cumulative category standings" },
+  { id:"points",     label:"Points (Seasonal)",  desc:"Season-long cumulative total fantasy points" },
+];
+
+// Returns true if the format is category-based (h2h_cats or roto)
+function isCatFormat(fmt) {
+  return fmt === "h2h_cats" || fmt === "roto";
+}
 
 /* ── PERFORMANCE BENCHMARKS (avg pts/game) ─────────────────────
    Below 55% of these = flagged as underperforming.
@@ -693,11 +709,13 @@ function analyzeNeeds(roster) {
 /* ═══════════════════════════════════════════════════════════════
    FA FIT SCORING
    ═══════════════════════════════════════════════════════════════ */
-function faFitScore(fa, posNeeds, catNeeds, active) {
+function faFitScore(fa, posNeeds, catNeeds, active, scoringFormat) {
+  var fmt = scoringFormat || "h2h_points";
+  var catLeague = isCatFormat(fmt);
   let score = 0;
   const breakdown = [];
 
-  // 1. Position need fit (max 40)
+  // 1. Position need fit (max 40) — same across all formats
   const filledNeeds = posNeeds.filter(n => n.type === fa.type && eligibleFor(fa, n.pos));
   if (filledNeeds.length > 0) {
     const topNeed = filledNeeds.sort((a,b) => a.avgAtPos - b.avgAtPos)[0];
@@ -708,40 +726,55 @@ function faFitScore(fa, posNeeds, catNeeds, active) {
     breakdown.push({ label:"No position need filled", pts:0, positive:false });
   }
 
-  // 2. Production vs active roster (max 20)
+  // 2. Production vs active roster
+  // Points leagues: production is king (max 28)
+  // Category leagues: raw FP/G matters less (max 14)
+  var prodMax = catLeague ? 14 : 28;
   const peers = active.filter(ap => ap.type===fa.type && canFillSlot(fa, ap)).sort((a,b)=>a.fpAvg-b.fpAvg);
   const worst = peers[0];
   if (worst && fa.fpAvg > worst.fpAvg) {
-    const gain = Math.min(20, Math.round((fa.fpAvg - worst.fpAvg) * 3));
+    const gain = Math.min(prodMax, Math.round((fa.fpAvg - worst.fpAvg) * 3));
     score += gain;
     breakdown.push({ label:`Upgrades ${worst.name} (${worst.fpAvg.toFixed(1)} → ${fa.fpAvg.toFixed(1)})`, pts:gain, positive:true });
   } else if (worst) {
     breakdown.push({ label:`Worse than ${worst.name} (${worst.fpAvg.toFixed(1)}/gm active)`, pts:0, positive:false });
   }
 
-  // 3. Dynasty age value (max 25)
+  // 3. Dynasty age value (max 25) — same across all formats
   const tier = ageTier(fa.age || 25);
   const agePts = Math.round((tier.score / 50) * 25);
   score += agePts;
   breakdown.push({ label:`Age ${fa.age || "?"}: ${tier.label}`, pts: agePts, positive: agePts >= 12 });
 
-  // 4. Prospect bonus (max 15)
+  // 4. Prospect bonus (max 15) — same across all formats
   if (fa.isProspect) {
     score += 15;
     breakdown.push({ label:"Prospect — long-term dynasty asset", pts:15, positive:true });
   }
 
-  // 5. Category need bonus (max 10)
+  // 5. Category need bonus
+  // Category leagues (h2h_cats, roto): categories are the whole game (max 20)
+  // Points leagues: minor bonus for category depth (max 8)
+  var catHrSb   = catLeague ? 10 : 4;
+  var catSv     = catLeague ? 20 : 8;
+  var catQs     = catLeague ? 10 : 4;
+  var catK      = catLeague ?  6 : 3;
   let catMatch = false;
+  let catPtsAdded = 0;
   if (fa.type === "hitter") {
-    if (fa.hr > 0 && catNeeds.some(c=>c.cat==="HR Power"))  { score += 5; catMatch = true; }
-    if (fa.sb > 0 && catNeeds.some(c=>c.cat==="Speed/SB"))  { score += 5; catMatch = true; }
+    if (fa.hr > 0 && catNeeds.some(c=>c.cat==="HR Power"))  { score += catHrSb; catPtsAdded += catHrSb; catMatch = true; }
+    if (fa.sb > 0 && catNeeds.some(c=>c.cat==="Speed/SB"))  { score += catHrSb; catPtsAdded += catHrSb; catMatch = true; }
   } else {
-    if (fa.sv > 0 && catNeeds.some(c=>c.cat==="Saves"))     { score += 10; catMatch = true; }
-    if (fa.qs > 0 && catNeeds.some(c=>c.cat==="Quality Starts")) { score += 5; catMatch = true; }
-    if (fa.k  > 0 && catNeeds.some(c=>c.cat==="Strikeouts")) { score += 3; catMatch = true; }
+    if (fa.sv > 0 && catNeeds.some(c=>c.cat==="Saves"))     { score += catSv;   catPtsAdded += catSv;   catMatch = true; }
+    if (fa.qs > 0 && catNeeds.some(c=>c.cat==="Quality Starts")) { score += catQs; catPtsAdded += catQs; catMatch = true; }
+    if (fa.k  > 0 && catNeeds.some(c=>c.cat==="Strikeouts")) { score += catK;   catPtsAdded += catK;    catMatch = true; }
   }
-  if (catMatch) breakdown.push({ label:"Fills a category weakness", pts:5, positive:true });
+  if (catMatch) {
+    var catLabel = catLeague
+      ? "Fills a category weakness (" + (fmt === "roto" ? "critical in roto" : "key in cat league") + ")"
+      : "Fills a category weakness";
+    breakdown.push({ label: catLabel, pts: catPtsAdded, positive: true });
+  }
 
   return { score: Math.min(100, Math.round(score)), breakdown };
 }
@@ -769,7 +802,10 @@ function suggestedBid(fitScore, dynastyVal, remainingFaab) {
 /* ═══════════════════════════════════════════════════════════════
    SUGGESTION ENGINE (roster)
    ═══════════════════════════════════════════════════════════════ */
-function generateSuggestions(hitters, pitchers) {
+function generateSuggestions(hitters, pitchers, league) {
+  var scoringFormat = (league && league.scoringFormat) || "h2h_points";
+  var catLeague = isCatFormat(scoringFormat);
+  var fmtLabel = catLeague ? (scoringFormat === "roto" ? "roto" : "category league") : "points league";
   const all = [...hitters,...pitchers];
   const active=all.filter(p=>p.status==="Act"), reserve=all.filter(p=>p.status==="Res"), ir=all.filter(p=>p.status==="IR");
   const sugs = [];
@@ -783,10 +819,13 @@ function generateSuggestions(hitters, pitchers) {
     if (ap.fpAvg < bmk*0.55 && ap.gp>=minGP) {
       const upgrades=reserve.filter(r=>r.type===ap.type&&r.gp>=(ap.type==="hitter"?3:2)&&r.fpAvg>ap.fpAvg&&canFillSlot(r,ap)).sort((a,b)=>b.fpAvg-a.fpAvg);
       const priority=ap.fpAvg<bmk*0.33?"critical":"high";
+      var fmtNote = catLeague
+        ? " In a " + fmtLabel + ", multi-category production is key — a dead spot hurts across the board."
+        : " Every FP/gm of production matters in a " + fmtLabel + ".";
       if (upgrades.length>0) {
-        sugs.push({ id:`swap-${ap.id}`, priority, category:"swap", headline:`Bench ${ap.name} → Activate ${upgrades[0].name}`, rationale:`${ap.name} averaging ${ap.fpAvg.toFixed(2)}/gm (${ap.gp} GP) — far below the ${bmk} benchmark. ${upgrades[0].name} is sitting on your bench averaging ${upgrades[0].fpAvg.toFixed(2)}/gm.`, bench:ap, activate:upgrades[0] });
+        sugs.push({ id:`swap-${ap.id}`, priority, category:"swap", headline:`Bench ${ap.name} → Activate ${upgrades[0].name}`, rationale:`${ap.name} averaging ${ap.fpAvg.toFixed(2)}/gm (${ap.gp} GP) — far below the ${bmk} benchmark. ${upgrades[0].name} is sitting on your bench averaging ${upgrades[0].fpAvg.toFixed(2)}/gm.${fmtNote}`, bench:ap, activate:upgrades[0] });
       } else {
-        sugs.push({ id:`flag-${ap.id}`, priority:"medium", category:"waiver", headline:`${ap.name} underperforming — check waiver wire`, rationale:`${ap.name} averaging ${ap.fpAvg.toFixed(2)}/gm (${ap.gp} GP) with no bench upgrade available. Use the FA Analyzer tab to find a replacement.`, bench:ap, activate:null });
+        sugs.push({ id:`flag-${ap.id}`, priority:"medium", category:"waiver", headline:`${ap.name} underperforming — check waiver wire`, rationale:`${ap.name} averaging ${ap.fpAvg.toFixed(2)}/gm (${ap.gp} GP) with no bench upgrade available.${fmtNote} Use the FA Analyzer tab to find a replacement.`, bench:ap, activate:null });
       }
     }
   }
@@ -804,7 +843,10 @@ function generateSuggestions(hitters, pitchers) {
     if (ap.gp===0) sugs.push({ id:`nogp-${ap.id}`, priority:"medium", category:"monitor", headline:`${ap.name} active but has 0 GP — verify status`, rationale:`${ap.name} (${ap.team}, ${ap.pos}) is on your active roster but hasn't logged a game yet. Confirm they're in their team's lineup before Monday's lock.`, bench:null, activate:ap });
   }
   if (!active.some(p=>p.type==="pitcher"&&p.pos==="RP")) {
-    sugs.push({ id:"no-saves", priority:"high", category:"waiver", headline:"No active closer — use FA Analyzer to find one", rationale:"Saves are worth +6 pts each. Check the FA Analyzer tab to evaluate available closers.", bench:null, activate:null });
+    var savesNote = catLeague
+      ? "Saves are a full category — missing a closer is a guaranteed 0 in that column every week."
+      : "Saves are worth +6 pts each. Check the FA Analyzer tab to evaluate available closers.";
+    sugs.push({ id:"no-saves", priority:"high", category:"waiver", headline:"No active closer — use FA Analyzer to find one", rationale:savesNote, bench:null, activate:null });
   }
   for (const p of ir) sugs.push({ id:`ir-${p.id}`, priority:"low", category:"monitor", headline:`Plan ahead: ${p.name} is on IL/IR`, rationale:`${p.name} (${p.team}, ${p.pos}) on injured reserve. When their MLB team activates them, clear a spot in advance.`, bench:null, activate:p });
   for (const rp of reserve) {
@@ -890,8 +932,11 @@ function newsSignalTypeForPlayer(n, playerName) {
 }
 
 // Generate differentials — always produces content from roster data, news is a bonus layer
-function generateDifferentials(roster, newsArr, mlbDir) {
+function generateDifferentials(roster, newsArr, mlbDir, league) {
   if (!roster) return [];
+  var scoringFormat = (league && league.scoringFormat) || "h2h_points";
+  var catLeague = isCatFormat(scoringFormat);
+  var fmtLabel = catLeague ? (scoringFormat === "roto" ? "roto" : "cat league") : "points league";
   var diffs = [];
   var all = roster.all;
   var news = newsArr || [];
@@ -924,8 +969,8 @@ function generateDifferentials(roster, newsArr, mlbDir) {
       riskColor: "bg-amber-100 border-amber-300 text-amber-900",
       badgeColor: "bg-amber-500 text-white",
       rationale: pn.length
-        ? p.name + " (Dynasty Score " + ds + ", Age " + (p.age || "?") + ") has fresh news and is sitting on your bench. This is a high-upside activation candidate right now."
-        : p.name + " (Dynasty Score " + ds + ", Age " + (p.age || "?") + ") is your highest-value bench player. If their MLB team needs them or matchups line up, activating them could win you the week.",
+        ? p.name + " (Dynasty Score " + ds + ", Age " + (p.age || "?") + ") has fresh news and is sitting on your bench. This is a high-upside activation candidate right now." + (catLeague ? " In a " + fmtLabel + ", their multi-category upside makes the activation even more compelling." : "")
+        : p.name + " (Dynasty Score " + ds + ", Age " + (p.age || "?") + ") is your highest-value bench player." + (catLeague ? " In a " + fmtLabel + ", their ceiling across multiple categories could swing a matchup." : " If matchups line up, activating them could win you the week."),
       news: pn.slice(0, 1),
       upside: upside,
       risk: risk,
@@ -1077,10 +1122,29 @@ function SettingsPanel({ league, onChange, onClose }) {
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
         </div>
         <div className="px-6 py-5 space-y-4">
-          {[{k:"name",label:"League Name"},{k:"platform",label:"Platform"},{k:"scoring",label:"Scoring Format"}].map(({k,label})=>(
+          {[{k:"name",label:"League Name"},{k:"platform",label:"Platform"}].map(({k,label})=>(
             <div key={k}><label className="text-xs font-semibold text-gray-600 block mb-1">{label}</label>
               <input className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-400" value={d[k]} onChange={e=>set(k,e.target.value)}/></div>
           ))}
+          {/* ── Scoring Format Selector ── */}
+          <div>
+            <label className="text-xs font-semibold text-gray-600 block mb-2">Scoring Format</label>
+            <div className="grid grid-cols-2 gap-2 mb-2">
+              {SCORING_FORMATS.map(function(sf) {
+                var isActive = d.scoringFormat === sf.id;
+                return (
+                  <button key={sf.id} type="button"
+                    onClick={function(){ setD(function(p){ return Object.assign({}, p, { scoringFormat: sf.id }); }); }}
+                    className={"text-left border-2 rounded-xl px-3 py-2 transition-all " + (isActive ? "border-blue-500 bg-blue-50" : "border-gray-200 hover:border-blue-300 bg-white")}>
+                    <div className={"text-xs font-bold " + (isActive ? "text-blue-700" : "text-gray-700")}>{sf.label} {isActive && "✓"}</div>
+                    <div className={"text-xs mt-0.5 leading-snug " + (isActive ? "text-blue-500" : "text-gray-400")}>{sf.desc}</div>
+                  </button>
+                );
+              })}
+            </div>
+            <label className="text-xs text-gray-500 block mb-1">Custom label (shown in header)</label>
+            <input className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-400" value={d.scoring} onChange={e=>set('scoring',e.target.value)} placeholder="e.g. H2H Points · Median (14 teams)"/>
+          </div>
           <div className="grid grid-cols-2 gap-4">
             {[{k:"maxStarts",label:"Max Starts/Week"},{k:"maxSaves",label:"Max Saves/Week"},{k:"totalFaab",label:"Total FAAB Budget ($)"},{k:"remainingFaab",label:"Remaining FAAB ($)"}].map(({k,label})=>(
               <div key={k}><label className="text-xs font-semibold text-gray-600 block mb-1">{label}</label>
@@ -2352,10 +2416,10 @@ function FaForm({ onAdd, mlbDir, ownedNames }) {
   );
 }
 
-function FaCard({ fa, roster, posNeeds, catNeeds, remainingFaab, onRemove }) {
+function FaCard({ fa, roster, posNeeds, catNeeds, remainingFaab, onRemove, scoringFormat }) {
   const [open, setOpen] = useState(true);
   const active = roster ? roster.all.filter(p=>p.status==="Act") : [];
-  const { score: fitScore, breakdown } = faFitScore(fa, posNeeds, catNeeds, active);
+  const { score: fitScore, breakdown } = faFitScore(fa, posNeeds, catNeeds, active, scoringFormat);
   const ds      = dynastyScore(fa);
   const verdict = faVerdict(fitScore, ds);
   const bid     = suggestedBid(fitScore, ds, remainingFaab);
@@ -2992,14 +3056,14 @@ function FaVsRosterModal({ faPlayer, roster, onClose }) {
   );
 }
 
-function FaResults({ faPlayers, roster, positionNeeds, categoryNeeds, remaining, faFilter, posFilter, setFaFilter, setPosFilter, removeFa }) {
+function FaResults({ faPlayers, roster, positionNeeds, categoryNeeds, remaining, faFilter, posFilter, setFaFilter, setPosFilter, removeFa, scoringFormat }) {
   const [compareTarget, setCompareTarget] = React.useState(null);
   const active = roster ? roster.all.filter(p => p.status === "Act") : [];
 
   // Score every player (reuse pre-computed values from bulk import if present)
   const scored = useMemo(() => {
     return faPlayers.map(fa => {
-      const fitScore = fa._fitScore    != null ? fa._fitScore    : faFitScore(fa, positionNeeds, categoryNeeds, active).score;
+      const fitScore = fa._fitScore    != null ? fa._fitScore    : faFitScore(fa, positionNeeds, categoryNeeds, active, scoringFormat).score;
       const ds       = fa._dynastyScore != null ? fa._dynastyScore : dynastyScore(fa);
       const verdict  = faVerdict(fitScore, ds);
       const combined = fitScore * 0.65 + ds * 0.35;
@@ -3090,9 +3154,19 @@ function FaResults({ faPlayers, roster, positionNeeds, categoryNeeds, remaining,
       {/* ── Smart Targets ── */}
       {hasSmartTargets && (
         <div className="mb-5">
-          <div className="flex items-center gap-2 mb-3">
+          <div className="flex items-center gap-2 mb-3 flex-wrap">
             <h3 className="font-bold text-gray-800 text-sm">🎯 Suggested Targets for Your Team</h3>
             {!roster && <span className="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-2 py-0.5">⚠ Import your roster CSV for personalized picks</span>}
+            {(function() {
+              var fmt = league.scoringFormat || "h2h_points";
+              var fmtInfo = SCORING_FORMATS.find(function(f){ return f.id === fmt; });
+              var catL = isCatFormat(fmt);
+              return (
+                <span className={"text-xs px-2.5 py-1 rounded-full font-semibold " + (catL ? "bg-purple-100 text-purple-700" : "bg-blue-100 text-blue-700")}>
+                  {catL ? "📊 Category weights boosted" : "🔢 Points-optimized"} · {fmtInfo ? fmtInfo.label : fmt}
+                </span>
+              );
+            })()}
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
@@ -3216,7 +3290,8 @@ function FaResults({ faPlayers, roster, positionNeeds, categoryNeeds, remaining,
         <div className="space-y-3">
           {displayed.map(fa => (
             <FaCard key={fa.id} fa={fa} roster={roster} posNeeds={positionNeeds}
-              catNeeds={categoryNeeds} remainingFaab={remaining} onRemove={removeFa}/>
+              catNeeds={categoryNeeds} remainingFaab={remaining} onRemove={removeFa}
+              scoringFormat={scoringFormat}/>
           ))}
         </div>
       )}
@@ -3261,7 +3336,7 @@ function FaAnalyzerTab({ roster, league, onFaabChange, news, onGoToNews,
       const ts     = Date.now();
       const pool = rawPlayers.map(function(p, idx) {
         var fa = Object.assign({}, p, { id: "fa-csv-" + (p.id || p.name) + "-" + ts + "-" + idx, fromImport: true });
-        var fitResult = faFitScore(fa, positionNeeds, categoryNeeds, active);
+        var fitResult = faFitScore(fa, positionNeeds, categoryNeeds, active, league.scoringFormat);
         var ds        = dynastyScore(fa);
         var verdict   = faVerdict(fitResult.score, ds);
         var combined  = fitResult.score * 0.65 + ds * 0.35;
@@ -3486,6 +3561,7 @@ function FaAnalyzerTab({ roster, league, onFaabChange, news, onGoToNews,
             setFaFilter={setFaFilter}
             setPosFilter={setPosFilter}
             removeFa={removeFa}
+            scoringFormat={league.scoringFormat}
           />
         </div>
       )}
@@ -3892,7 +3968,9 @@ function TradePlayerCard({ player, onRemove }) {
 }
 
 /* ── Trade Analysis Panel ──────────────────────────────────────*/
-function TradeAnalysisPanel({ givePlayers, recvPlayers, roster, positionNeeds, categoryNeeds }) {
+function TradeAnalysisPanel({ givePlayers, recvPlayers, roster, positionNeeds, categoryNeeds, league }) {
+  var scoringFormat = (league && league.scoringFormat) || "h2h_points";
+  var catLeague = isCatFormat(scoringFormat);
   // ── Per-player scores ──
   const giveScores = givePlayers.map(p => ({ ...p, ds: dynastyScore(p) }));
   const recvScores = recvPlayers.map(p => ({ ...p, ds: dynastyScore(p) }));
@@ -3922,13 +4000,36 @@ function TradeAnalysisPanel({ givePlayers, recvPlayers, roster, positionNeeds, c
     !recvPlayers.some(p => p.type === n.type && eligibleFor(p, n.pos))
   ).length;
 
-  // ── Overall verdict (dynasty-weighted for dynasty league) ──
+  // ── Category advantage score (for h2h_cats / roto leagues) ──
+  const catNeedsFilled  = categoryNeeds.filter(cn => {
+    if (cn.cat === "HR Power")       return recvPlayers.some(p => p.hr > 0)  && !givePlayers.some(p => p.hr > 0);
+    if (cn.cat === "Speed/SB")       return recvPlayers.some(p => p.sb > 0)  && !givePlayers.some(p => p.sb > 0);
+    if (cn.cat === "Saves")          return recvPlayers.some(p => p.sv > 0)  && !givePlayers.some(p => p.sv > 0);
+    if (cn.cat === "Strikeouts")     return recvPlayers.some(p => p.k > 0)   && !givePlayers.some(p => p.k > 0);
+    if (cn.cat === "Quality Starts") return recvPlayers.some(p => p.qs > 0)  && !givePlayers.some(p => p.qs > 0);
+    return false;
+  }).length;
+  const catNeedsVacated = categoryNeeds.filter(cn => {
+    if (cn.cat === "HR Power")       return givePlayers.some(p => p.hr > 0)  && !recvPlayers.some(p => p.hr > 0);
+    if (cn.cat === "Speed/SB")       return givePlayers.some(p => p.sb > 0)  && !recvPlayers.some(p => p.sb > 0);
+    if (cn.cat === "Saves")          return givePlayers.some(p => p.sv > 0)  && !recvPlayers.some(p => p.sv > 0);
+    if (cn.cat === "Strikeouts")     return givePlayers.some(p => p.k > 0)   && !recvPlayers.some(p => p.k > 0);
+    if (cn.cat === "Quality Starts") return givePlayers.some(p => p.qs > 0)  && !recvPlayers.some(p => p.qs > 0);
+    return false;
+  }).length;
+  const catAdv = (catNeedsFilled - catNeedsVacated) * 20;
+
+  // ── Overall verdict — weights shift based on scoring format ──
+  // Points leagues: production is king (50%), dynasty important (40%), position minor (10%)
+  // Category leagues: dynasty + categories balanced (35%/30%), production matters less (25%), position (10%)
   const dsTotal    = Math.max(totalGiveDs + totalRecvDs, 1);
   const dynastyAdv = ((totalRecvDs   - totalGiveDs)   / dsTotal) * 100;
   const prodTotal  = Math.max(totalGiveProd + totalRecvProd, 0.01);
   const prodAdv    = ((totalRecvProd - totalGiveProd)  / prodTotal) * 100;
   const posAdv     = (needsFilled - needsVacated) * 15;
-  const overallAdv = dynastyAdv * 0.45 + prodAdv * 0.40 + posAdv * 0.15;
+  const overallAdv = catLeague
+    ? dynastyAdv * 0.35 + prodAdv * 0.25 + catAdv * 0.30 + posAdv * 0.10
+    : dynastyAdv * 0.40 + prodAdv * 0.50 + posAdv * 0.10;
 
   const verdict =
     overallAdv >= 22  ? { label:"You Win",              emoji:"🏆", color:"bg-green-600",  text:"text-green-700",  border:"border-green-200 bg-green-50"  } :
@@ -4314,9 +4415,13 @@ function TradeTab({ roster, league, mlbDir, dirLoading, dirLoaded, dirError, onL
       {/* ── Analysis ── */}
       {canAnalyze ? (
         <div>
-          <div className="flex items-center gap-2 mb-3">
+          <div className="flex items-center gap-2 mb-3 flex-wrap">
             <h3 className="font-bold text-gray-800 text-sm">⚖️ Trade Analysis</h3>
-            <span className="text-xs text-gray-400">Dynasty weights: Dynasty 45% · Production 40% · Position 15%</span>
+            <span className="text-xs text-gray-400">
+              {isCatFormat(league.scoringFormat)
+                ? "Dynasty 35% · Production 25% · Categories 30% · Position 10%"
+                : "Dynasty 40% · Production 50% · Position 10%"}
+            </span>
           </div>
           <TradeAnalysisPanel
             givePlayers={givePlayers}
@@ -4324,6 +4429,7 @@ function TradeTab({ roster, league, mlbDir, dirLoading, dirLoaded, dirError, onL
             roster={roster}
             positionNeeds={positionNeeds}
             categoryNeeds={categoryNeeds}
+            league={league}
           />
         </div>
       ) : (
@@ -4476,7 +4582,7 @@ function processAdvisorQuery(rawQ, roster, mlbDir, news, league) {
       .filter(function(p){ return !p.isMinors && !owned.has(p.name) && p.fpAvg > 0; })
       .map(function(p){
         var ds3 = dynastyScore(p);
-        var fit3 = faFitScore(p, posNeeds2, [], rAct2).score;
+        var fit3 = faFitScore(p, posNeeds2, [], rAct2, league ? league.scoringFormat : "h2h_points").score;
         return Object.assign({},p,{ _dynastyScore:ds3, _fitScore:fit3, _combined:fit3*0.6+ds3*0.4 });
       })
       .sort(function(a,b){ return b._combined - a._combined; })
@@ -5260,7 +5366,8 @@ function App({ user }) {
         var data = doc.data();
         // Restore league settings + skip onboarding for returning users
         if (data.settings && data.settings.onboarded) {
-          setLeague(data.settings);
+          // Merge with DEFAULT_LEAGUE so new fields (e.g. scoringFormat) get defaults for old accounts
+          setLeague(Object.assign({}, DEFAULT_LEAGUE, data.settings));
           setOnboardingDone(true);
         }
         // Restore roster CSV
@@ -5356,7 +5463,7 @@ function App({ user }) {
 
   const onDrop = useCallback((e)=>{e.preventDefault();setDragOver(false);handleFile(e.dataTransfer.files[0]);},[handleFile]);
 
-  const suggestions = useMemo(()=>roster?generateSuggestions(roster.hitters,roster.pitchers):[],[roster]);
+  const suggestions = useMemo(()=>roster?generateSuggestions(roster.hitters,roster.pitchers,league):[],[roster,league]);
 
   const counts = useMemo(()=>{
     if (!roster) return {};
@@ -5410,7 +5517,12 @@ function App({ user }) {
             <span className="text-2xl">⚾</span>
             <div>
               <h1 className="text-base font-black">{league.name}</h1>
-              <p className="text-blue-300 text-xs">{league.scoring} · {league.platform}</p>
+              <p className="text-blue-300 text-xs">
+                {league.scoring} · {league.platform}
+                {" "}<span className="text-blue-400/70">
+                  {league.scoringFormat === "h2h_cats" ? "· 📊 H2H Cats" : league.scoringFormat === "roto" ? "· 📊 Roto" : league.scoringFormat === "points" ? "· 🔢 Points" : ""}
+                </span>
+              </p>
               {filename && <p className="text-slate-400 text-xs mt-0.5">📄 {filename} · {importDate}</p>}
             </div>
           </div>
@@ -5533,7 +5645,7 @@ function App({ user }) {
 
             {/* ── Differentials ── */}
             {(function() {
-              var diffs = generateDifferentials(roster, news, mlbDir);
+              var diffs = generateDifferentials(roster, news, mlbDir, league);
               if (!diffs.length) return null;
               return (
                 <div className="mb-6">
