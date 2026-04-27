@@ -1,41 +1,10 @@
-# Netlify HTTP Response Headers
-# ─────────────────────────────────────────────────────────────────────────────
-# Deploy: commit this file to your GitHub repo root → Netlify picks it up automatically.
+# Netlify HTTP Response Headers — applied to every page on the site
 
 /*
-  # ── Prevent clickjacking ──────────────────────────────────────────────────
   X-Frame-Options: DENY
-
-  # ── Stop MIME type sniffing ───────────────────────────────────────────────
   X-Content-Type-Options: nosniff
-
-  # ── Legacy XSS auditor (older browsers) ──────────────────────────────────
   X-XSS-Protection: 1; mode=block
-
-  # ── Force HTTPS for 1 year once first visited ────────────────────────────
   Strict-Transport-Security: max-age=31536000; includeSubDomains
-
-  # ── Don't leak your URL to external sites ────────────────────────────────
   Referrer-Policy: strict-origin-when-cross-origin
-
-  # ── Disable unused browser features ──────────────────────────────────────
   Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=()
-
-  # ── Content Security Policy ───────────────────────────────────────────────
-  #
-  # script-src:
-  #   'unsafe-inline' + 'unsafe-eval'  — required by Tailwind Play CDN and Babel standalone (JSX runtime)
-  #   https://www.gstatic.com          — Firebase SDK scripts
-  #   https://unpkg.com                — React, ReactDOM, Babel CDN
-  #   https://cdn.tailwindcss.com      — Tailwind Play CDN
-  #
-  # connect-src:
-  #   Firebase Auth & Firestore require several googleapis.com subdomains
-  #   MLB, ESPN, RSS proxy, and news source domains for data fetching
-  #
-  # frame-src:
-  #   accounts.google.com — Google OAuth popup window
-  #
-  # img-src:
-  #   lh3.googleusercontent.com — Google profile photos
-  Content-Security-Policy: default-src 'none'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.tailwindcss.com https://unpkg.com https://www.gstatic.com; connect-src 'self' https://statsapi.mlb.com https://site.api.espn.com https://api.rss2json.com https://nitter.privacydev.net https://bleacherreport.com https://blogs.fangraphs.com https://mlb.nbcsports.com https://sports.yahoo.com https://www.cbssports.com https://www.mlb.com https://www.rotowire.com https://firestore.googleapis.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://www.googleapis.com https://accounts.google.com https://*.firebaseio.com; style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; img-src 'self' data: https: https://lh3.googleusercontent.com; font-src 'self' data: https:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-src https://accounts.google.com; frame-ancestors 'none';
+  Content-Security-Policy: default-src 'none'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.tailwindcss.com https://unpkg.com https://www.gstatic.com; connect-src 'self' https://unpkg.com https://www.gstatic.com https://statsapi.mlb.com https://site.api.espn.com https://api.rss2json.com https://nitter.privacydev.net https://bleacherreport.com https://blogs.fangraphs.com https://mlb.nbcsports.com https://sports.yahoo.com https://www.cbssports.com https://www.mlb.com https://www.rotowire.com https://firestore.googleapis.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://www.googleapis.com https://accounts.google.com https://*.firebaseio.com https://*.firebase.google.com; style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; img-src 'self' data: https:; font-src 'self' data: https:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-src https://accounts.google.com https://*.firebaseapp.com; frame-ancestors 'none';
