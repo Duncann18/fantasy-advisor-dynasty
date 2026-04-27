@@ -32,6 +32,10 @@
   <script src="https://unpkg.com/react@18.2.0/umd/react.production.min.js" crossorigin="anonymous"></script>
   <script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js" crossorigin="anonymous"></script>
   <script src="https://unpkg.com/@babel/standalone@7.23.5/babel.min.js" crossorigin="anonymous"></script>
+  <!-- Firebase SDK (compat v10 — works as window.firebase global) -->
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 
   <style>
     body { font-family: system-ui, -apple-system, sans-serif; margin: 0; }
@@ -53,6 +57,39 @@
    ═══════════════════════════════════════════════════════════════ */
 
 const { useState, useMemo, useRef, useCallback } = React;
+
+/* ═══════════════════════════════════════════════════════════════
+   FIREBASE CONFIG
+   ─────────────────────────────────────────────────────────────
+   1. Go to https://console.firebase.google.com
+   2. Create a project → Add a Web App
+   3. Copy the firebaseConfig object values below
+   4. In Firebase Console → Authentication → Sign-in method → Enable Google
+   5. In Firestore Database → Create database (production mode)
+   6. In Firestore → Rules, paste these rules and Publish:
+        rules_version = '2';
+        service cloud.firestore {
+          match /databases/{database}/documents {
+            match /users/{userId}/{document=**} {
+              allow read, write: if request.auth != null
+                                 && request.auth.uid == userId;
+            }
+          }
+        }
+   7. In Authentication → Settings → Authorized domains → add your Netlify domain
+   ═══════════════════════════════════════════════════════════════*/
+var FIREBASE_CONFIG = {
+  apiKey:            "AIzaSyBb7MTG7sr9afktSvDoHIVcDBhgB8gL_rM",
+  authDomain:        "fantasy-roster-advisor.firebaseapp.com",
+  projectId:         "fantasy-roster-advisor",
+  storageBucket:     "fantasy-roster-advisor.firebasestorage.app",
+  messagingSenderId: "150403182787",
+  appId:             "1:150403182787:web:08bf8ce801b4902c707276",
+  measurementId:     "G-461KDE03HJ"
+};
+if (!firebase.apps.length) { firebase.initializeApp(FIREBASE_CONFIG); }
+var _db   = firebase.firestore();
+var _auth = firebase.auth();
 
 /* ── LEAGUE CONFIG ─────────────────────────────────────────────
    Change these to match your league settings.
@@ -259,6 +296,133 @@ function safeHref(url) {
   var trimmed = url.trim();
   if (/^https?:\/\//i.test(trimmed)) return trimmed;
   return null; // reject everything else (javascript:, data:, vbscript:, etc.)
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   AUTH LAYER — Google Sign-In + Firebase
+   ═══════════════════════════════════════════════════════════════*/
+
+/* ── Waiting spinner shown while Firebase checks auth state ── */
+function LoadingScreen() {
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-slate-900 to-blue-900 flex items-center justify-center">
+      <div className="text-center">
+        <div className="text-5xl mb-4 animate-pulse">⚾</div>
+        <p className="text-blue-300 text-sm">Loading…</p>
+      </div>
+    </div>
+  );
+}
+
+/* ── Full-page Google login screen ── */
+function LoginScreen() {
+  var [busy,  setBusy]  = React.useState(false);
+  var [err,   setErr]   = React.useState(null);
+
+  function signInWithGoogle() {
+    setBusy(true); setErr(null);
+    var provider = new firebase.auth.GoogleAuthProvider();
+    _auth.signInWithPopup(provider).catch(function(e) {
+      setErr(e.message || "Sign-in failed. Please try again.");
+      setBusy(false);
+    });
+  }
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-slate-900 to-blue-900 flex items-center justify-center px-4">
+      <div className="bg-white rounded-2xl shadow-2xl p-10 max-w-sm w-full">
+        {/* Logo + title */}
+        <div className="text-center mb-8">
+          <div className="text-6xl mb-3">⚾</div>
+          <h1 className="text-2xl font-black text-gray-900">Fantasy Roster Advisor</h1>
+          <p className="text-gray-400 text-sm mt-1">Dynasty Edition</p>
+        </div>
+
+        {/* Feature grid */}
+        <div className="grid grid-cols-2 gap-2 mb-8">
+          {[["🎯","Smart Moves"],["🔍","FA Analyzer"],["⚖️","Trade Grades"],["📰","Live News"]].map(function(r) {
+            return (
+              <div key={r[1]} className="bg-slate-50 rounded-xl p-2.5 text-center border border-slate-100">
+                <div className="text-lg mb-0.5">{r[0]}</div>
+                <div className="text-xs font-semibold text-gray-600">{r[1]}</div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Google sign-in button */}
+        <button
+          onClick={signInWithGoogle}
+          disabled={busy}
+          className="w-full flex items-center justify-center gap-3 border border-gray-200 rounded-xl px-6 py-3 text-gray-700 font-semibold hover:bg-gray-50 transition-colors disabled:opacity-60"
+        >
+          {/* Inline Google logo SVG */}
+          <svg viewBox="0 0 24 24" className="w-5 h-5 shrink-0">
+            <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/>
+            <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
+            <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/>
+            <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/>
+          </svg>
+          <span>{busy ? "Signing in…" : "Continue with Google"}</span>
+        </button>
+
+        {err && (
+          <p className="mt-4 text-xs text-red-600 text-center bg-red-50 rounded-lg px-3 py-2">{err}</p>
+        )}
+        <p className="mt-5 text-center text-xs text-gray-400">Your data is private and only visible to you.</p>
+      </div>
+    </div>
+  );
+}
+
+/* ── User avatar + name + sign-out chip shown in the app header ── */
+function UserBadge({ user, onSignOut }) {
+  var [menuOpen, setMenuOpen] = React.useState(false);
+  return (
+    <div className="relative">
+      <button
+        onClick={function() { setMenuOpen(function(o) { return !o; }); }}
+        className="flex items-center gap-2 bg-white/10 hover:bg-white/20 border border-white/20 rounded-lg px-2.5 py-1.5 transition-colors"
+      >
+        {user.photoURL
+          ? <img src={user.photoURL} alt="" className="w-6 h-6 rounded-full border border-white/30"/>
+          : <span className="w-6 h-6 rounded-full bg-blue-500 flex items-center justify-center text-xs font-bold text-white">{(user.displayName || "?")[0]}</span>}
+        <span className="text-white text-xs font-medium hidden sm:block max-w-[120px] truncate">{user.displayName || user.email}</span>
+        <span className="text-white/60 text-xs">▾</span>
+      </button>
+      {menuOpen && (
+        <div className="absolute right-0 top-full mt-1 bg-white rounded-xl shadow-xl border border-gray-100 min-w-[180px] z-50 overflow-hidden">
+          <div className="px-4 py-3 border-b border-gray-100">
+            <p className="text-xs font-semibold text-gray-800 truncate">{user.displayName}</p>
+            <p className="text-xs text-gray-400 truncate">{user.email}</p>
+          </div>
+          <button
+            onClick={function() { setMenuOpen(false); onSignOut(); }}
+            className="w-full text-left px-4 py-2.5 text-xs text-red-600 hover:bg-red-50 transition-colors font-medium"
+          >
+            Sign out
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ── Auth wrapper — manages Firebase auth state, shows login or app ── */
+function AppWithAuth() {
+  var [user,        setUser]        = React.useState(null);
+  var [authChecked, setAuthChecked] = React.useState(false);
+
+  React.useEffect(function() {
+    return _auth.onAuthStateChanged(function(u) {
+      setUser(u);
+      setAuthChecked(true);
+    });
+  }, []);
+
+  if (!authChecked) return <LoadingScreen/>;
+  if (!user)        return <LoginScreen/>;
+  return <App user={user}/>;
 }
 
 function ageTier(age) {
@@ -4758,7 +4922,7 @@ function AdvisorTab({ roster, mlbDir, dirLoaded, dirLoading, onLoadDirectory, ne
 /* ═══════════════════════════════════════════════════════════════
    ONBOARDING MODAL  — mandatory first-run walkthrough
    ═══════════════════════════════════════════════════════════════ */
-function OnboardingModal({ leagueName, onRosterFile, roster, onFaFile, onComplete }) {
+function OnboardingModal({ leagueName, onRosterFile, roster, onFaFile, onComplete, onLeagueNameChange }) {
   const [step,        setStep]        = useState(0);
   const [dragging,    setDragging]    = useState(false);
   const [fileError,   setFileError]   = useState(null);
@@ -4812,12 +4976,30 @@ function OnboardingModal({ leagueName, onRosterFile, roster, onFaFile, onComplet
 
   /* ── STEP 0: Welcome ── */
   function StepWelcome() {
+    var [localName, setLocalName] = React.useState(leagueName || "");
     return (
       <div className="text-center px-2">
-        <div className="text-6xl mb-4">⚾</div>
-        <h2 className="text-2xl font-black text-gray-900 mb-2">{leagueName}</h2>
-        <p className="text-gray-500 text-sm mb-6 max-w-xs mx-auto">Your personal dynasty advisor. Before we start, let's get everything connected so you get the best recommendations.</p>
-        <div className="grid grid-cols-2 gap-3 mb-8 text-left">
+        <div className="text-6xl mb-3">⚾</div>
+        <h2 className="text-xl font-black text-gray-900 mb-1">Welcome to Fantasy Roster Advisor</h2>
+        <p className="text-gray-500 text-sm mb-5 max-w-xs mx-auto">Your personal dynasty advisor. Let's get your league set up — takes about 2 minutes.</p>
+
+        {/* League name input */}
+        <div className="text-left mb-5">
+          <label className="text-xs font-bold text-gray-600 block mb-1.5">Your League Name</label>
+          <input
+            type="text"
+            value={localName}
+            placeholder="e.g. Dynasty Field of Dreams"
+            onChange={function(e) {
+              setLocalName(e.target.value);
+              if (onLeagueNameChange) onLeagueNameChange(e.target.value);
+            }}
+            className="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+          />
+          <p className="text-xs text-gray-400 mt-1">This will appear in your dashboard header.</p>
+        </div>
+
+        <div className="grid grid-cols-2 gap-3 mb-6 text-left">
           {[
             ["🎯","Moves","Smart adds, drops & lineup decisions"],
             ["🔍","FA Analyzer","Rank every free agent for your team"],
@@ -4833,13 +5015,14 @@ function OnboardingModal({ leagueName, onRosterFile, roster, onFaFile, onComplet
             );
           })}
         </div>
-        <p className="text-xs text-gray-400 mb-5">Takes about 2 minutes. You'll need your Fantrax roster CSV.</p>
         <button
           onClick={function() { setStep(1); }}
-          className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-xl text-sm transition-colors"
+          disabled={!localName.trim()}
+          className="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white font-bold py-3 rounded-xl text-sm transition-colors"
         >
           Get Started →
         </button>
+        {!localName.trim() && <p className="text-xs text-gray-400 mt-2">Enter a league name to continue.</p>}
       </div>
     );
   }
@@ -5046,7 +5229,7 @@ function OnboardingModal({ leagueName, onRosterFile, roster, onFaFile, onComplet
 /* ═══════════════════════════════════════════════════════════════
    ROOT APP
    ═══════════════════════════════════════════════════════════════ */
-function App() {
+function App({ user }) {
   const [roster,       setRoster]       = useState(null);
   const [tab,          setTab]          = useState("fa");
   const [dragOver,     setDragOver]     = useState(false);
@@ -5068,6 +5251,58 @@ function App() {
   const [lastUpdated,     setLastUpdated]     = useState(null);
   const [pendingFaText,   setPendingFaText]   = useState(null);
   const fileRef = useRef();
+
+  // ── Firestore persistence ──────────────────────────────────────
+  // dataLoaded tracks whether we've finished loading the user's saved data.
+  // We only save BACK to Firestore after that to avoid an immediate write-back.
+  var dataLoaded = React.useRef(false);
+
+  // Load saved data when the user signs in
+  React.useEffect(function() {
+    if (!user) return;
+    dataLoaded.current = false;
+    _db.collection("users").doc(user.uid).get().then(function(doc) {
+      if (doc.exists) {
+        var data = doc.data();
+        // Restore league settings + skip onboarding for returning users
+        if (data.settings && data.settings.onboarded) {
+          setLeague(data.settings);
+          setOnboardingDone(true);
+        }
+        // Restore roster CSV
+        if (data.rosterCsv) {
+          try {
+            var parsed = parseFantraxCSV(data.rosterCsv);
+            if (parsed.all.length > 0) {
+              setRoster(parsed);
+              setFilename(data.rosterFilename || "saved-roster.csv");
+              setImportDate("☁ restored");
+            }
+          } catch(e) {}
+        }
+        // Restore FA CSV (will be processed by FaAnalyzerTab)
+        if (data.faCsv) { setPendingFaText(data.faCsv); }
+      }
+      dataLoaded.current = true;
+    }).catch(function() { dataLoaded.current = true; });
+  }, [user.uid]);
+
+  // Auto-save league settings whenever they change (skips the initial load)
+  React.useEffect(function() {
+    if (!dataLoaded.current || !user) return;
+    _db.collection("users").doc(user.uid).set(
+      { settings: Object.assign({}, league, { onboarded: onboardingDone }) },
+      { merge: true }
+    );
+  }, [league, onboardingDone]);
+
+  // Save FA CSV text to Firestore as soon as it is uploaded
+  React.useEffect(function() {
+    if (!pendingFaText || !user || !dataLoaded.current) return;
+    _db.collection("users").doc(user.uid).set({ faCsv: pendingFaText }, { merge: true });
+  }, [pendingFaText]);
+
+  function handleSignOut() { _auth.signOut(); }
 
   const loadDirectory = useCallback(async () => {
     setDirLoading(true); setDirError(null);
@@ -5103,7 +5338,8 @@ function App() {
     const reader = new FileReader();
     reader.onload = e => {
       try {
-        const parsed = parseFantraxCSV(e.target.result);
+        var csvText = e.target.result;
+        const parsed = parseFantraxCSV(csvText);
         if (parsed.all.length===0) throw new Error(`No players found (${parsed.hitters.length} hitters, ${parsed.pitchers.length} pitchers detected). Make sure you're using a Fantrax Team Roster CSV export — go to My Team → Roster, scroll to the bottom, and click Export → CSV.`);
         setRoster(parsed);
         setFilename(file.name);
@@ -5112,10 +5348,17 @@ function App() {
         // Auto-fetch news for the new roster
         setNews([]); setNewsLoaded(false);
         loadNews(parsed.all);
+        // Persist to Firestore so it restores on next login
+        if (user && dataLoaded.current) {
+          _db.collection("users").doc(user.uid).set(
+            { rosterCsv: csvText, rosterFilename: file.name },
+            { merge: true }
+          );
+        }
       } catch(err) { setError(err.message); }
     };
     reader.readAsText(file);
-  }, [loadNews]);
+  }, [loadNews, user]);
 
   const onDrop = useCallback((e)=>{e.preventDefault();setDragOver(false);handleFile(e.dataTransfer.files[0]);},[handleFile]);
 
@@ -5143,10 +5386,24 @@ function App() {
           onRosterFile={handleFile}
           roster={roster}
           onFaFile={setPendingFaText}
+          onLeagueNameChange={function(name) {
+            setLeague(function(l) { return Object.assign({}, l, { name: name }); });
+          }}
           onComplete={function() {
             setOnboardingDone(true);
             setTab("suggestions");
             loadDirectory();
+            // Save profile + mark onboarded so this user skips onboarding on next login
+            if (user) {
+              _db.collection("users").doc(user.uid).set({
+                profile: {
+                  name:  user.displayName || "",
+                  email: user.email       || "",
+                  photo: user.photoURL    || ""
+                },
+                settings: Object.assign({}, league, { onboarded: true })
+              }, { merge: true });
+            }
           }}
         />
       )}
@@ -5182,6 +5439,7 @@ function App() {
             <button onClick={()=>fileRef.current?.click()} className="bg-white/10 hover:bg-white/20 border border-white/20 text-white text-xs px-3 py-2 rounded-lg">{roster ? "↑ New CSV" : "↑ Import Roster CSV"}</button>
             <button onClick={()=>setShowSettings(true)} className="bg-white/10 hover:bg-white/20 border border-white/20 text-white text-xs px-3 py-2 rounded-lg">⚙</button>
             <input ref={fileRef} type="file" accept=".csv" className="hidden" onChange={e=>handleFile(e.target.files[0])}/>
+            <UserBadge user={user} onSignOut={handleSignOut}/>
           </div>
         </div>
       </div>
@@ -5408,7 +5666,7 @@ function App() {
 }
 
 const root = ReactDOM.createRoot(document.getElementById("root"));
-root.render(<App/>);
+root.render(<AppWithAuth/>);
 </script>
 </body>
 </html>

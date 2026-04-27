@@ -1,0 +1,32 @@
+# Netlify Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+# Deploy: commit this file to your GitHub repo root alongside index.html.
+# Netlify reads it automatically on every deploy.
+
+[build]
+  # No build command needed — this is a plain HTML file
+  publish = "."
+
+# Force all HTTP traffic to HTTPS
+[[redirects]]
+  from   = "http://yourdomain.com/*"
+  to     = "https://yourdomain.com/:splat"
+  status = 301
+  force  = true
+
+# Cache CDN-loaded assets aggressively (they're version-pinned so safe to cache)
+# The HTML itself is not cached so updates deploy instantly
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "no-cache, no-store, must-revalidate"
+
+[[headers]]
+  for = "/*.js"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+[[headers]]
+  for = "/*.css"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
