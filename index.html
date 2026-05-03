@@ -89,10 +89,11 @@ var _auth = firebase.auth();
    Change these to match your league settings.
    ─────────────────────────────────────────────────────────────*/
 const DEFAULT_LEAGUE = {
-  name:          "Dynasty Field of Dreams S4",
-  platform:      "Fantrax",
-  scoringFormat: "h2h_points",   // h2h_points | h2h_cats | roto | points
-  scoring:       "H2H Points · Median (14 teams)",
+  name:            "Dynasty Field of Dreams S4",
+  platform:        "Fantrax",
+  fantraxLeagueId: "",           // paste your Fantrax league ID for direct FA page links
+  scoringFormat:   "h2h_points", // h2h_points | h2h_cats | roto | points
+  scoring:         "H2H Points · Median (14 teams)",
   maxStarts:     10,         // max pitching starts per week
   maxSaves:      10,         // max saves per week
   totalFaab:     200,        // $200 season FAAB budget (Fantrax rules)
@@ -1266,6 +1267,13 @@ function SettingsPanel({ league, onChange, onClose }) {
             <div key={k}><label className="text-xs font-semibold text-gray-600 block mb-1">{label}</label>
               <input className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-400" value={d[k]} onChange={e=>set(k,e.target.value)}/></div>
           ))}
+          <div>
+            <label className="text-xs font-semibold text-gray-600 block mb-1">Fantrax League ID <span className="text-gray-400 font-normal">(optional — enables direct FA page link)</span></label>
+            <input className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-400 font-mono"
+              placeholder="e.g. abc123xyz"
+              value={d.fantraxLeagueId || ""} onChange={e=>set('fantraxLeagueId', e.target.value.trim())}/>
+            <p className="text-xs text-gray-400 mt-1">Find it in your Fantrax URL: fantrax.com/fantasy/league/<strong>LEAGUE_ID</strong>/home</p>
+          </div>
           {/* ── Scoring Format Selector ── */}
           <div>
             <label className="text-xs font-semibold text-gray-600 block mb-2">Scoring Format</label>
@@ -3448,6 +3456,8 @@ function FaAnalyzerTab({ roster, league, onFaabChange, news, onGoToNews,
   const [faFilter,      setFaFilter]      = useState("targets");
   const [posFilter,     setPosFilter]     = useState("all");
   const [compareTarget, setCompareTarget] = useState(null); // player being compared vs roster
+  const [faImportedAt,  setFaImportedAt]  = useState(null); // timestamp of last FA CSV import
+  const [faDragOver,    setFaDragOver]    = useState(false);
   const fileRef = useRef();
 
   const remaining = parseInt(faabInput)||0;
@@ -3483,6 +3493,7 @@ function FaAnalyzerTab({ roster, league, onFaabChange, news, onGoToNews,
         return Object.assign({}, fa, { _fitScore: fitResult.score, _dynastyScore: ds, _verdict: verdict.label, _combined: combined });
       }).sort(function(a, b){ return b._combined - a._combined; });
       setImportPool(pool);
+      setFaImportedAt(Date.now());
     } catch(e) {}
   };
 
@@ -3652,21 +3663,101 @@ function FaAnalyzerTab({ roster, league, onFaabChange, news, onGoToNews,
         remaining={remaining}
       />
 
-      {/* ── Import FA CSV ── */}
-      <div className="bg-white rounded-xl shadow p-5">
-        <div className="flex items-center justify-between mb-2">
-          <div>
-            <h3 className="font-bold text-gray-800 text-sm">Import FA List from Fantrax</h3>
-            <p className="text-xs text-gray-400 mt-0.5">Upload your free agent CSV and we'll rank every player for your team — then you pick who to evaluate.</p>
+      {/* ── Import FA List from Fantrax ── */}
+      {(function() {
+        var leagueId = league.fantraxLeagueId || "";
+        var fantraxFaUrl = leagueId
+          ? "https://www.fantrax.com/newui/fantasy/league/" + leagueId + "/players;statusOrTeamFilter=FA"
+          : "https://www.fantrax.com";
+
+        // Staleness helper
+        var faAgeLabel = null;
+        var faIsStale  = false;
+        if (faImportedAt) {
+          var minsAgo = Math.floor((Date.now() - faImportedAt) / 60000);
+          if (minsAgo < 60)       { faAgeLabel = minsAgo + "m ago";                    faIsStale = false; }
+          else if (minsAgo < 1440){ faAgeLabel = Math.floor(minsAgo/60) + "h ago";    faIsStale = minsAgo > 360; }
+          else                    { faAgeLabel = Math.floor(minsAgo/1440) + "d ago";   faIsStale = true; }
+        }
+
+        return (
+          <div className="rounded-xl border-2 border-blue-100 bg-gradient-to-b from-blue-50 to-white shadow-sm overflow-hidden">
+            {/* Header */}
+            <div className="px-5 pt-5 pb-3 flex items-start justify-between gap-3 flex-wrap">
+              <div>
+                <h3 className="font-bold text-gray-800 text-sm flex items-center gap-2">
+                  📋 Fantrax FA List
+                  {faAgeLabel && (
+                    <span className={"text-xs font-semibold px-2 py-0.5 rounded-full " + (faIsStale ? "bg-amber-100 text-amber-700" : "bg-green-100 text-green-700")}>
+                      {faIsStale ? "⚠ " : "✓ "}{faAgeLabel}
+                    </span>
+                  )}
+                </h3>
+                <p className="text-xs text-gray-400 mt-0.5">
+                  {importPool.length > 0
+                    ? importPool.length + " free agents ranked for your roster" + (faIsStale ? " — consider refreshing" : "")
+                    : "Import your Fantrax FA list to see ranked pickups for your team"}
+                </p>
+              </div>
+              {importPool.length > 0 && (
+                <button onClick={clearPool} className="text-xs text-gray-400 hover:text-red-400 transition-colors shrink-0">✕ Clear list</button>
+              )}
+            </div>
+
+            {/* Step-by-step guide */}
+            <div className="px-5 pb-4">
+              <div className="flex items-stretch gap-2 flex-wrap sm:flex-nowrap">
+
+                {/* Step 1 */}
+                <a href={fantraxFaUrl} target="_blank" rel="noopener noreferrer"
+                  className={"flex-1 min-w-[140px] rounded-xl border-2 px-4 py-3 text-center transition-all cursor-pointer " + (leagueId ? "border-blue-400 bg-blue-600 hover:bg-blue-700 text-white" : "border-gray-200 bg-gray-50 text-gray-500")}>
+                  <div className="text-lg mb-0.5">1️⃣</div>
+                  <div className="text-xs font-bold">Open Fantrax</div>
+                  <div className={"text-xs mt-0.5 " + (leagueId ? "text-blue-100" : "text-gray-400")}>
+                    {leagueId ? "↗ Go to FA page" : "Add League ID in ⚙ Settings"}
+                  </div>
+                </a>
+
+                <div className="hidden sm:flex items-center text-gray-300 text-lg">→</div>
+
+                {/* Step 2 */}
+                <div className="flex-1 min-w-[140px] rounded-xl border-2 border-gray-200 bg-gray-50 px-4 py-3 text-center">
+                  <div className="text-lg mb-0.5">2️⃣</div>
+                  <div className="text-xs font-bold text-gray-700">Export CSV</div>
+                  <div className="text-xs text-gray-400 mt-0.5">Scroll down → Export → CSV</div>
+                </div>
+
+                <div className="hidden sm:flex items-center text-gray-300 text-lg">→</div>
+
+                {/* Step 3 — drop zone */}
+                <div
+                  onDragOver={function(e){ e.preventDefault(); setFaDragOver(true); }}
+                  onDragLeave={function(){ setFaDragOver(false); }}
+                  onDrop={function(e){ e.preventDefault(); setFaDragOver(false); handleFaFile(e.dataTransfer.files[0]); }}
+                  onClick={function(){ fileRef.current && fileRef.current.click(); }}
+                  className={"flex-1 min-w-[140px] rounded-xl border-2 border-dashed px-4 py-3 text-center cursor-pointer transition-all " + (faDragOver ? "border-blue-500 bg-blue-50" : "border-blue-300 hover:border-blue-400 hover:bg-blue-50 bg-white")}>
+                  <div className="text-lg mb-0.5">{faDragOver ? "📂" : "3️⃣"}</div>
+                  <div className="text-xs font-bold text-blue-700">{faDragOver ? "Drop it!" : "Drop CSV here"}</div>
+                  <div className="text-xs text-blue-400 mt-0.5">or click to browse</div>
+                </div>
+
+              </div>
+              <input ref={fileRef} type="file" accept=".csv" className="hidden" onChange={function(e){ handleFaFile(e.target.files[0]); }}/>
+            </div>
+
+            {/* Stale warning banner */}
+            {faIsStale && importPool.length > 0 && (
+              <div className="px-5 pb-4">
+                <div className="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 flex items-center justify-between gap-3">
+                  <span className="text-xs text-amber-700">⚠ Your FA list is over 6 hours old — waiver claims may have changed.</span>
+                  <a href={fantraxFaUrl} target="_blank" rel="noopener noreferrer"
+                    className="text-xs font-semibold text-amber-700 hover:text-amber-900 shrink-0">Refresh ↗</a>
+                </div>
+              </div>
+            )}
           </div>
-          <button onClick={()=>fileRef.current?.click()}
-            className="shrink-0 bg-slate-700 hover:bg-slate-900 text-white text-xs font-semibold px-4 py-2 rounded-lg transition-colors flex items-center gap-1.5">
-            📁 Upload FA CSV
-          </button>
-          <input ref={fileRef} type="file" accept=".csv" className="hidden" onChange={e=>handleFaFile(e.target.files[0])}/>
-        </div>
-        <p className="text-xs text-gray-400">In Fantrax: <strong>Players → Free Agents</strong> → scroll to bottom → <strong>Export → CSV</strong>.</p>
-      </div>
+        );
+      })()}
 
       {/* ── Target Picker (shown after FA CSV import) ── */}
       {importPool.length > 0 && (
